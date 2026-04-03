@@ -30,7 +30,6 @@ pub enum SamplerChoice {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModelChoice {
-    StableAudioOpen,
     #[default]
     Heartmula,
 }
@@ -103,9 +102,6 @@ pub struct GenerateRequest {
     /// Seed for deterministic HeartCodec decoder latent initialization
     #[serde(default)]
     pub decoder_seed: u64,
-    /// Load HeartMuLa/HeartCodec stages on demand and release HeartMuLa before decode
-    #[serde(default)]
-    pub lazy: bool,
 }
 
 fn default_ode_steps() -> usize {
@@ -148,7 +144,7 @@ Usage:
   maolan-generate [options] <prompt-or-lyrics>
 
 Options:
-  --model <stable-audio-open|heartmula>
+  --model <heartmula>
   --model-dir <path>
   --float-size <f16|f32>  HeartMula defaults to f32 when omitted
   --output <path>
@@ -171,7 +167,6 @@ Options:
   --decode-only            Decode an existing frames JSON instead of generating tokens
   --frames-json <path>     Frames JSON input for --decode-only
   --decode-threads <int>    Number of worker threads for decode-only CPU decoding
-  --lazy                   HeartMula: release the token generator before codec decode
   -h, --help
 "
 }
@@ -203,7 +198,6 @@ pub fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<CliOpti
     let mut frames_json = None;
     let mut decode_threads = None;
     let mut decoder_seed = 0_u64;
-    let mut lazy = false;
 
     while let Some(arg) = args.next() {
         let arg = arg
@@ -382,11 +376,6 @@ pub fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<CliOpti
             continue;
         }
 
-        if arg == "--lazy" {
-            lazy = true;
-            continue;
-        }
-
         if arg == "--model" {
             let value = args
                 .next()
@@ -394,12 +383,9 @@ pub fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<CliOpti
                 .into_string()
                 .map_err(|_| anyhow!("model value must be valid UTF-8"))?;
             model = match value.as_str() {
-                "stable-audio-open" => ModelChoice::StableAudioOpen,
                 "heartmula" => ModelChoice::Heartmula,
                 _ => {
-                    bail!(
-                        "unsupported model '{value}', expected one of: stable-audio-open, heartmula"
-                    )
+                    bail!("unsupported model '{value}', expected: heartmula")
                 }
             };
             continue;
@@ -545,7 +531,6 @@ pub fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<CliOpti
         frames_json,
         decode_threads,
         decoder_seed,
-        lazy,
     })
 }
 
@@ -852,17 +837,6 @@ mod tests {
         ];
         let options = parse_options(args).expect("options should parse");
         assert_eq!(options.decode_threads, Some(8));
-    }
-
-    #[test]
-    fn parses_lazy_flag() {
-        let args = [
-            OsString::from("generate"),
-            OsString::from("--lazy"),
-            OsString::from("prompt"),
-        ];
-        let options = parse_options(args).expect("options should parse");
-        assert!(options.lazy);
     }
 
     const _: () = assert!(DEFAULT_MAX_PROMPT_TOKENS == 128);
