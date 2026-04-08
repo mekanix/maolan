@@ -490,6 +490,8 @@ pub struct Track {
     pub video_clip: Option<VideoClipData>,
     pub video_frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
     pub video_current_frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
+    pub video_frame_interval_samples: usize,
+    pub video_last_push_sample: Option<usize>,
     #[cfg(all(unix, not(target_os = "macos")))]
     pub lv2_state_base_dir: Option<PathBuf>,
     pub session_base_dir: Option<PathBuf>,
@@ -575,6 +577,8 @@ impl Track {
             video_clip: None,
             video_frame: None,
             video_current_frame: None,
+            video_frame_interval_samples: sample_rate.max(1.0).round() as usize,
+            video_last_push_sample: None,
             #[cfg(all(unix, not(target_os = "macos")))]
             lv2_state_base_dir: None,
             session_base_dir: None,

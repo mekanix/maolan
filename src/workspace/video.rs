@@ -26,6 +26,15 @@ impl Video {
         }
     }
 
+    fn frame_is_usable(
+        frame: &std::sync::Arc<
+            maolan_engine::mutex::UnsafeMutex<maolan_engine::message::VideoFrameBuffer>,
+        >,
+    ) -> bool {
+        let frame = frame.lock();
+        frame.width > 0 && frame.height > 0 && !frame.rgba.is_empty()
+    }
+
     fn frame_element(
         frame: Option<
             &std::sync::Arc<
@@ -65,7 +74,16 @@ impl Video {
             maolan_engine::mutex::UnsafeMutex<maolan_engine::message::VideoFrameBuffer>,
         >,
     > {
-        video.current_frame.as_ref().or(video.frame.as_ref())
+        video
+            .current_frame
+            .as_ref()
+            .filter(|frame| Self::frame_is_usable(frame))
+            .or_else(|| {
+                video
+                    .frame
+                    .as_ref()
+                    .filter(|frame| Self::frame_is_usable(frame))
+            })
     }
 
     fn session_video_files(session_root: Option<&PathBuf>) -> Vec<String> {

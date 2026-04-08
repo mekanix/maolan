@@ -214,3 +214,30 @@ pub fn decode_frame_at_sample(
         .map(|frame| Arc::new(UnsafeMutex::new(frame)))
         .ok_or_else(|| "no decoded video frame available".to_string())
 }
+
+pub fn estimate_frame_interval_samples(
+    clip: &VideoClipData,
+    sample_rate: f64,
+) -> Result<usize, String> {
+    ffmpeg_init().map_err(|e| format!("ffmpeg init failed: {e}"))?;
+
+    let input = format::input(&clip.path).map_err(|e| format!("open video failed: {e}"))?;
+    let Some(stream) = input.streams().best(media::Type::Video) else {
+        return Err("no video stream found".to_string());
+    };
+    let rate = {
+        let avg = stream.avg_frame_rate();
+        if avg.numerator() > 0 && avg.denominator() > 0 {
+            avg
+        } else {
+            let nominal = stream.rate();
+            if nominal.numerator() > 0 && nominal.denominator() > 0 {
+                nominal
+            } else {
+                ffmpeg_next::Rational(25, 1)
+            }
+        }
+    };
+    let fps = f64::from(rate.numerator().max(1)) / f64::from(rate.denominator().max(1));
+    Ok((sample_rate.max(1.0) / fps.max(1.0)).round().max(1.0) as usize)
+}

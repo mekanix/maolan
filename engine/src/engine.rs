@@ -339,6 +339,39 @@ impl Engine {
         });
     }
 
+    fn maybe_push_video_current_frames(&self, force: bool) {
+        let current_sample = self.transport_sample;
+        let due_tracks = {
+            let state = self.state.lock();
+            state
+                .tracks
+                .iter()
+                .filter_map(|(track_name, track_handle)| {
+                    let track = track_handle.lock();
+                    track.video_clip.as_ref()?;
+                    let interval = track.video_frame_interval_samples.max(1);
+                    let should_push = force
+                        || track.video_current_frame.is_none()
+                        || track.video_last_push_sample.is_none()
+                        || track
+                            .video_last_push_sample
+                            .is_some_and(|last| current_sample < last)
+                        || track
+                            .video_last_push_sample
+                            .is_some_and(|last| current_sample.abs_diff(last) >= interval);
+                    should_push.then_some(track_name.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for track_name in due_tracks {
+            if let Some(track_handle) = self.state.lock().tracks.get(&track_name).cloned() {
+                track_handle.lock().video_last_push_sample = Some(current_sample);
+            }
+            self.request_track_video_current_frame(&track_name, current_sample);
+        }
+    }
+
     fn default_clip_plugin_graph_json(audio_ins: usize, audio_outs: usize) -> serde_json::Value {
         let connections = (0..audio_ins.min(audio_outs))
             .map(|port| {
@@ -1375,6 +1408,7 @@ impl Engine {
             self.transport_sample = sample;
             self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
                 .await;
+            self.maybe_push_video_current_frames(true);
         }
     }
 
@@ -3728,6 +3762,7 @@ impl Engine {
                         }
                     }
                 }
+                self.maybe_push_video_current_frames(true);
             }
             Action::SetLoopEnabled(enabled) => {
                 self.loop_enabled = enabled && self.loop_range_samples.is_some();
@@ -5614,6 +5649,14 @@ impl Engine {
                 track.has_video = track.has_video || clip.is_some();
                 track.video_frame = None;
                 track.video_current_frame = None;
+                track.video_last_push_sample = None;
+                track.video_frame_interval_samples = clip
+                    .as_ref()
+                    .map(|clip| self.resolve_video_clip_data(clip))
+                    .and_then(|clip| {
+                        video::estimate_frame_interval_samples(&clip, track.sample_rate).ok()
+                    })
+                    .unwrap_or_else(|| track.sample_rate.max(1.0).round() as usize);
                 if clip.is_some() {
                     self.request_track_video_frame(track_name);
                     self.request_track_video_current_frame(track_name, self.transport_sample);
@@ -6478,6 +6521,14 @@ impl Engine {
                 Message::Channel(s) => {
                     self.clients.push(s);
                 }
+                Message::Response(result) => match result {
+                    Ok(action) => {
+                        self.handle_request(action).await;
+                    }
+                    Err(err) => {
+                        self.notify_clients(Err(err)).await;
+                    }
+                },
 
                 Message::Request(a) => match a {
                     Action::TrackOfflineBounceCancel { track_name } => {
@@ -6625,6 +6676,7 @@ impl Engine {
                                 )))
                                 .await;
                             }
+                            self.maybe_push_video_current_frames(false);
                         }
                     }
                     if self.send_tracks().await && self.hw_worker.is_some() {

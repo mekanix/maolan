@@ -50,16 +50,15 @@ impl Maolan {
         let (view_is_video, track_name, needs_preview_frame, needs_current_frame) = {
             let state = self.state.blocking_read();
             let selected_name = state.selected.iter().next().cloned();
-            let track = if selected_name.is_some() {
-                selected_name.as_ref().and_then(|name| {
+            let track = selected_name
+                .as_ref()
+                .and_then(|name| {
                     state
                         .tracks
                         .iter()
                         .find(|track| &track.name == name && track.video.is_some())
                 })
-            } else {
-                state.tracks.iter().find(|track| track.video.is_some())
-            };
+                .or_else(|| state.tracks.iter().find(|track| track.video.is_some()));
             let track_name = track.map(|track| track.name.clone());
             let needs_preview_frame = track
                 .and_then(|track| track.video.as_ref())
@@ -68,7 +67,7 @@ impl Maolan {
                 .and_then(|track| track.video.as_ref())
                 .is_some_and(|video| video.current_frame.is_none());
             (
-                matches!(state.view, View::Video),
+                matches!(state.view, View::Video) || state.video_preview_visible,
                 track_name,
                 needs_preview_frame,
                 needs_current_frame,
@@ -8491,22 +8490,32 @@ impl Maolan {
             }
             Message::Workspace => {
                 let mut state = self.state.blocking_write();
-                state.view = View::Workspace;
+                state.view = if state.video_preview_visible {
+                    View::Video
+                } else {
+                    View::Workspace
+                };
                 state.pitch_correction = None;
                 state.pitch_correction_selected_points.clear();
                 state.pitch_correction_dragging_points = None;
                 state.pitch_correction_selecting_rect = None;
                 drop(state);
+                if let Some(task) = self.request_visible_video_preview_frame(true) {
+                    return task;
+                }
                 return self.queue_midi_clip_preview_loads();
             }
             Message::Video => {
                 let mut state = self.state.blocking_write();
-                state.view = if matches!(state.view, View::Video) {
+                state.video_preview_visible = !state.video_preview_visible;
+                state.view = if state.video_preview_visible {
+                    View::Video
+                } else if matches!(state.view, View::Video) {
                     View::Workspace
                 } else {
-                    View::Video
+                    state.view.clone()
                 };
-                let should_request = matches!(state.view, View::Video);
+                let should_request = state.video_preview_visible;
                 drop(state);
                 if !should_request {
                     self.last_video_preview_request = None;

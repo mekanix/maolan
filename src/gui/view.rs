@@ -194,6 +194,7 @@ impl Maolan {
                 }
                 _ => {
                     let view_kind = state.view.clone();
+                    let video_preview_visible = state.video_preview_visible;
                     let shift_pressed = state.shift;
                     let has_session_end = state
                         .tracks
@@ -452,6 +453,7 @@ impl Maolan {
                         self.editor_visible,
                         self.mixer_visible,
                         self.show_log_window,
+                        video_preview_visible,
                         &view_kind,
                     ),];
                     content = content.push(self.toolbar.view(ToolbarViewState {

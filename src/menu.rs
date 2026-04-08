@@ -188,6 +188,7 @@ impl Menu {
         editor_visible: bool,
         mixer_visible: bool,
         log_visible: bool,
+        video_preview_visible: bool,
         active_view: &View,
     ) -> iced::Element<'_, Message> {
         let menu_tpl = |items| IcedMenu::new(items).width(180.0).offset(15.0).spacing(5.0);
@@ -285,7 +286,7 @@ impl Menu {
                     )),
                     (menu_checkbox_item(
                         "Video",
-                        matches!(active_view, View::Video),
+                        video_preview_visible || matches!(active_view, View::Video),
                         Message::Video
                     )),
                     (menu_checkbox_item(
