@@ -905,11 +905,15 @@ impl Workspace {
 
     pub fn video_view(
         &self,
+        session_root: Option<&PathBuf>,
         split_resize_hovered: bool,
         split_secondary_resize_hovered: bool,
     ) -> Element<'_, Message> {
-        self.video
-            .view(split_resize_hovered, split_secondary_resize_hovered)
+        self.video.view(
+            session_root,
+            split_resize_hovered,
+            split_secondary_resize_hovered,
+        )
     }
 
     pub fn pitch_correction_view<'a>(

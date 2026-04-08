@@ -269,6 +269,7 @@ impl Maolan {
                             };
                             column![
                                 container(self.workspace.video_view(
+                                    self.session_dir.as_ref(),
                                     self.video_preview_split_resize_hovered,
                                     self.video_preview_split_secondary_resize_hovered,
                                 ),)

@@ -17,6 +17,7 @@ mod transport;
 mod ui;
 
 const CLIP_EDGE_SNAP_THRESHOLD_PX: f32 = 12.0;
+const VIDEO_PREVIEW_FPS: f64 = 12.0;
 
 struct MoveClipSnapArgs<'a> {
     kind: Kind,
@@ -40,6 +41,51 @@ impl Maolan {
 
     fn clip_edge_snap_enabled(&self) -> bool {
         matches!(self.snap_mode, crate::message::SnapMode::Clips)
+    }
+
+    pub(super) fn request_visible_video_preview_frame(
+        &mut self,
+        force: bool,
+    ) -> Option<Task<Message>> {
+        let (view_is_video, track_name) = {
+            let state = self.state.blocking_read();
+            let selected_name = state.selected.iter().next().cloned();
+            let track_name = if selected_name.is_some() {
+                selected_name.as_ref().and_then(|name| {
+                    state
+                        .tracks
+                        .iter()
+                        .find(|track| &track.name == name && track.video.is_some())
+                })
+            } else {
+                state.tracks.iter().find(|track| track.video.is_some())
+            }
+            .map(|track| track.name.clone());
+            (matches!(state.view, View::Video), track_name)
+        };
+        if !view_is_video {
+            return None;
+        }
+
+        let Some(track_name) = track_name else {
+            self.last_video_preview_request = None;
+            return None;
+        };
+
+        let sample = self.transport_samples.max(0.0) as usize;
+        let min_sample_delta = (self.playback_rate_hz / VIDEO_PREVIEW_FPS).max(1.0) as usize;
+        let now = Instant::now();
+        if !force
+            && let Some((last_track_name, last_sample, last_at)) = &self.last_video_preview_request
+            && *last_track_name == track_name
+            && sample.abs_diff(*last_sample) < min_sample_delta
+            && now.duration_since(*last_at) < Duration::from_millis(75)
+        {
+            return None;
+        }
+
+        self.last_video_preview_request = Some((track_name.clone(), sample, now));
+        Some(self.send(Action::RequestTrackVideoCurrentFrame { track_name, sample }))
     }
 
     fn nearest_clip_edge_sample(
@@ -2097,22 +2143,9 @@ impl Maolan {
                 let handled_response_track = self.handle_response_track_action(a);
                 let handled_response_timing = self.handle_response_timing_state_action(a);
                 if matches!(a, Action::TransportPosition(_))
-                    && matches!(self.state.blocking_read().view, View::Video)
+                    && let Some(task) = self.request_visible_video_preview_frame(true)
                 {
-                    let sample = self.transport_samples.max(0.0) as usize;
-                    let track_name = {
-                        let state = self.state.blocking_read();
-                        let selected_name = state.selected.iter().next().cloned();
-                        selected_name
-                            .as_ref()
-                            .and_then(|name| state.tracks.iter().find(|track| &track.name == name))
-                            .or_else(|| state.tracks.iter().find(|track| track.video.is_some()))
-                            .map(|track| track.name.clone())
-                    };
-                    if let Some(track_name) = track_name {
-                        return self
-                            .send(Action::RequestTrackVideoCurrentFrame { track_name, sample });
-                    }
+                    return task;
                 }
                 if handled_response_track {
                     match a {
@@ -6843,6 +6876,7 @@ impl Maolan {
                         tokio::spawn(async move {
                             let mut used_names = used_track_names;
                             let mut failures = Vec::new();
+                            let mut imported_files = 0usize;
 
                             for (idx, path) in paths.iter().enumerate() {
                                 let file_index = idx + 1;
@@ -6851,6 +6885,7 @@ impl Maolan {
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("unknown")
                                     .to_string();
+                                let mut file_imported = false;
 
                                 let tx_clone = tx.clone();
                                 let filename_for_progress = filename.clone();
@@ -6954,6 +6989,7 @@ impl Maolan {
                                                 failures.push(format!("{} ({e})", path.display()));
                                                 continue;
                                             }
+                                            file_imported = true;
                                         }
                                         Err(e) => {
                                             failures.push(format!("{} ({e})", path.display()));
@@ -6975,100 +7011,295 @@ impl Maolan {
 
                                     match Self::video_stream_info(path, playback_rate) {
                                         Ok((has_audio, video_length)) => {
-                                            let video_rel = match Self::import_video_to_session(
-                                                path,
-                                                &session_root,
-                                            ) {
-                                                Ok(rel) => rel,
-                                                Err(e) => {
-                                                    failures
-                                                        .push(format!("{} ({e})", path.display()));
-                                                    continue;
-                                                }
-                                            };
                                             let base = Self::import_track_base_name(path);
                                             let track_name =
                                                 Self::unique_track_name(&base, &mut used_names);
 
-                                            let mut audio_rel = None;
-                                            let mut channels = 0usize;
-                                            let mut audio_length = 0usize;
-                                            let mut peaks = None;
-                                            if has_audio {
-                                                match Self::import_embedded_video_audio_to_session_wav_with_progress(
-                                                    path,
-                                                    &session_root,
-                                                    playback_rate as u32,
-                                                    |progress, operation| {
-                                                        let _ = tx.send(Message::ImportProgress {
-                                                            file_index,
-                                                            total_files,
-                                                            file_progress: 0.2 + progress * 0.7,
-                                                            filename: filename.clone(),
-                                                            operation,
-                                                        });
-                                                    },
-                                                )
-                                                .await
-                                                {
-                                                    Ok((clip_rel, clip_channels, length, clip_peaks)) => {
-                                                        audio_rel = Some(clip_rel);
-                                                        channels = clip_channels;
-                                                        audio_length = length;
-                                                        peaks = Some(clip_peaks);
-                                                    }
-                                                    Err(e) => {
-                                                        failures.push(format!(
-                                                            "{} (audio import failed, video imported: {e})",
-                                                            path.display()
-                                                        ));
-                                                    }
-                                                }
-                                            } else if tx
+                                            if tx
                                                 .send(Message::ImportProgress {
                                                     file_index,
                                                     total_files,
-                                                    file_progress: 0.9,
+                                                    file_progress: 0.3,
                                                     filename: filename.clone(),
-                                                    operation: Some("Copying video".to_string()),
+                                                    operation: Some(if has_audio {
+                                                        "Splitting video and audio".to_string()
+                                                    } else {
+                                                        "Importing video".to_string()
+                                                    }),
                                                 })
                                                 .is_err()
                                             {
                                                 return;
                                             }
 
-                                            if let Err(e) = CLIENT
-                                                .send(EngineMessage::Request(Action::AddTrack {
-                                                    name: track_name.clone(),
-                                                    audio_ins: channels,
-                                                    midi_ins: 0,
-                                                    audio_outs: channels,
-                                                    midi_outs: 0,
-                                                    has_video: true,
-                                                }))
-                                                .await
-                                            {
-                                                failures.push(format!("{} ({e})", path.display()));
-                                                continue;
-                                            }
-                                            if let Err(e) = CLIENT
-                                                .send(EngineMessage::Request(
-                                                    Action::SetTrackVideoClip {
-                                                        track_name: track_name.clone(),
-                                                        clip: Some(
-                                                            maolan_engine::message::VideoClipData {
-                                                                path: video_rel,
-                                                                start: 0,
-                                                                length: video_length,
-                                                                offset: 0,
-                                                            },
-                                                        ),
+                                            let video_path = path.clone();
+                                            let video_session_root = session_root.clone();
+                                            let video_task =
+                                                tokio::task::spawn_blocking(move || {
+                                                    Self::import_video_to_session(
+                                                        &video_path,
+                                                        &video_session_root,
+                                                    )
+                                                });
+
+                                            let mut audio_rel = None;
+                                            let mut channels = 0usize;
+                                            let mut audio_length = 0usize;
+                                            let mut peaks = None;
+                                            if has_audio {
+                                                let audio_path = path.clone();
+                                                let audio_session_root = session_root.clone();
+                                                let audio_task = tokio::task::spawn_blocking(
+                                                    move || {
+                                                        Self::import_embedded_video_audio_to_session_wav(
+                                                            &audio_path,
+                                                            &audio_session_root,
+                                                            playback_rate as u32,
+                                                        )
                                                     },
-                                                ))
-                                                .await
-                                            {
-                                                failures.push(format!("{} ({e})", path.display()));
-                                                continue;
+                                                );
+
+                                                let video_rel = match video_task.await {
+                                                    Ok(Ok(rel)) => rel,
+                                                    Ok(Err(e)) => {
+                                                        failures.push(format!(
+                                                            "{} ({e})",
+                                                            path.display()
+                                                        ));
+                                                        continue;
+                                                    }
+                                                    Err(e) => {
+                                                        failures.push(format!(
+                                                            "{} (video import task failed: {e})",
+                                                            path.display()
+                                                        ));
+                                                        continue;
+                                                    }
+                                                };
+                                                match audio_task.await {
+                                                    Ok(Ok((
+                                                        clip_rel,
+                                                        clip_channels,
+                                                        length,
+                                                        clip_peaks,
+                                                    ))) => {
+                                                        if tx
+                                                            .send(Message::ImportProgress {
+                                                                file_index,
+                                                                total_files,
+                                                                file_progress: 0.85,
+                                                                filename: filename.clone(),
+                                                                operation: Some(
+                                                                    "Finishing extracted audio"
+                                                                        .to_string(),
+                                                                ),
+                                                            })
+                                                            .is_err()
+                                                        {
+                                                            return;
+                                                        }
+                                                        audio_rel = Some(clip_rel);
+                                                        channels = clip_channels;
+                                                        audio_length = length;
+                                                        peaks = Some(clip_peaks);
+                                                        if let Err(e) = CLIENT
+                                                            .send(EngineMessage::Request(
+                                                                Action::AddTrack {
+                                                                    name: track_name.clone(),
+                                                                    audio_ins: channels,
+                                                                    midi_ins: 0,
+                                                                    audio_outs: channels,
+                                                                    midi_outs: 0,
+                                                                    has_video: true,
+                                                                },
+                                                            ))
+                                                            .await
+                                                        {
+                                                            failures.push(format!(
+                                                                "{} ({e})",
+                                                                path.display()
+                                                            ));
+                                                            continue;
+                                                        }
+                                                        if let Err(e) = CLIENT
+                                                            .send(EngineMessage::Request(
+                                                                Action::SetTrackVideoClip {
+                                                                    track_name: track_name.clone(),
+                                                                    clip: Some(
+                                                                        maolan_engine::message::VideoClipData {
+                                                                            path: video_rel,
+                                                                            start: 0,
+                                                                            length: video_length,
+                                                                            offset: 0,
+                                                                        },
+                                                                    ),
+                                                                },
+                                                            ))
+                                                            .await
+                                                        {
+                                                            failures.push(format!(
+                                                                "{} ({e})",
+                                                                path.display()
+                                                            ));
+                                                            continue;
+                                                        }
+                                                        file_imported = true;
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        failures.push(format!(
+                                                            "{} (audio import failed, video imported: {e})",
+                                                            path.display()
+                                                        ));
+                                                        if let Err(e) = CLIENT
+                                                            .send(EngineMessage::Request(
+                                                                Action::AddTrack {
+                                                                    name: track_name.clone(),
+                                                                    audio_ins: 0,
+                                                                    midi_ins: 0,
+                                                                    audio_outs: 0,
+                                                                    midi_outs: 0,
+                                                                    has_video: true,
+                                                                },
+                                                            ))
+                                                            .await
+                                                        {
+                                                            failures.push(format!(
+                                                                "{} ({e})",
+                                                                path.display()
+                                                            ));
+                                                            continue;
+                                                        }
+                                                        if let Err(e) = CLIENT
+                                                            .send(EngineMessage::Request(
+                                                                Action::SetTrackVideoClip {
+                                                                    track_name: track_name.clone(),
+                                                                    clip: Some(
+                                                                        maolan_engine::message::VideoClipData {
+                                                                            path: video_rel,
+                                                                            start: 0,
+                                                                            length: video_length,
+                                                                            offset: 0,
+                                                                        },
+                                                                    ),
+                                                                },
+                                                            ))
+                                                            .await
+                                                        {
+                                                            failures.push(format!(
+                                                                "{} ({e})",
+                                                                path.display()
+                                                            ));
+                                                            continue;
+                                                        }
+                                                        file_imported = true;
+                                                    }
+                                                    Err(e) => {
+                                                        failures.push(format!(
+                                                            "{} (audio import task failed, video imported: {e})",
+                                                            path.display()
+                                                        ));
+                                                        if let Err(e) = CLIENT
+                                                            .send(EngineMessage::Request(
+                                                                Action::AddTrack {
+                                                                    name: track_name.clone(),
+                                                                    audio_ins: 0,
+                                                                    midi_ins: 0,
+                                                                    audio_outs: 0,
+                                                                    midi_outs: 0,
+                                                                    has_video: true,
+                                                                },
+                                                            ))
+                                                            .await
+                                                        {
+                                                            failures.push(format!(
+                                                                "{} ({e})",
+                                                                path.display()
+                                                            ));
+                                                            continue;
+                                                        }
+                                                        if let Err(e) = CLIENT
+                                                            .send(EngineMessage::Request(
+                                                                Action::SetTrackVideoClip {
+                                                                    track_name: track_name.clone(),
+                                                                    clip: Some(
+                                                                        maolan_engine::message::VideoClipData {
+                                                                            path: video_rel,
+                                                                            start: 0,
+                                                                            length: video_length,
+                                                                            offset: 0,
+                                                                        },
+                                                                    ),
+                                                                },
+                                                            ))
+                                                            .await
+                                                        {
+                                                            failures.push(format!(
+                                                                "{} ({e})",
+                                                                path.display()
+                                                            ));
+                                                            continue;
+                                                        }
+                                                        file_imported = true;
+                                                    }
+                                                }
+                                            } else {
+                                                let video_rel = match video_task.await {
+                                                    Ok(Ok(rel)) => rel,
+                                                    Ok(Err(e)) => {
+                                                        failures.push(format!(
+                                                            "{} ({e})",
+                                                            path.display()
+                                                        ));
+                                                        continue;
+                                                    }
+                                                    Err(e) => {
+                                                        failures.push(format!(
+                                                            "{} (video import task failed: {e})",
+                                                            path.display()
+                                                        ));
+                                                        continue;
+                                                    }
+                                                };
+                                                if let Err(e) = CLIENT
+                                                    .send(EngineMessage::Request(
+                                                        Action::AddTrack {
+                                                            name: track_name.clone(),
+                                                            audio_ins: 0,
+                                                            midi_ins: 0,
+                                                            audio_outs: 0,
+                                                            midi_outs: 0,
+                                                            has_video: true,
+                                                        },
+                                                    ))
+                                                    .await
+                                                {
+                                                    failures
+                                                        .push(format!("{} ({e})", path.display()));
+                                                    continue;
+                                                }
+                                                if let Err(e) = CLIENT
+                                                    .send(EngineMessage::Request(
+                                                        Action::SetTrackVideoClip {
+                                                            track_name: track_name.clone(),
+                                                            clip: Some(
+                                                                maolan_engine::message::VideoClipData {
+                                                                    path: video_rel,
+                                                                    start: 0,
+                                                                    length: video_length,
+                                                                    offset: 0,
+                                                                },
+                                                            ),
+                                                        },
+                                                    ))
+                                                    .await
+                                                {
+                                                    failures.push(format!(
+                                                        "{} ({e})",
+                                                        path.display()
+                                                    ));
+                                                    continue;
+                                                }
+                                                file_imported = true;
                                             }
 
                                             if let Some(clip_rel) = audio_rel {
@@ -7120,6 +7351,7 @@ impl Maolan {
                                                         .push(format!("{} ({e})", path.display()));
                                                     continue;
                                                 }
+                                                file_imported = true;
                                             }
                                         }
                                         Err(e) => {
@@ -7206,6 +7438,7 @@ impl Maolan {
                                                 failures.push(format!("{} ({e})", path.display()));
                                                 continue;
                                             }
+                                            file_imported = true;
                                         }
                                         Err(e) => {
                                             failures.push(format!("{} ({e})", path.display()));
@@ -7230,6 +7463,10 @@ impl Maolan {
                                         path.display()
                                     ));
                                 }
+
+                                if file_imported {
+                                    imported_files += 1;
+                                }
                             }
 
                             for err in &failures {
@@ -7237,12 +7474,11 @@ impl Maolan {
                             }
 
                             if tx
-                                .send(Message::ImportProgress {
-                                    file_index: total_files,
+                                .send(Message::ImportFinished {
                                     total_files,
-                                    file_progress: 1.0,
-                                    filename: "Done".to_string(),
-                                    operation: None,
+                                    imported_files,
+                                    failure_count: failures.len(),
+                                    first_failure: failures.first().cloned(),
                                 })
                                 .is_err()
                             {
@@ -8108,6 +8344,37 @@ impl Maolan {
                     );
                 }
             }
+            Message::ImportFinished {
+                total_files,
+                imported_files,
+                failure_count,
+                ref first_failure,
+            } => {
+                self.import_in_progress = false;
+                self.import_current_file = total_files;
+                self.import_total_files = total_files;
+                self.import_file_progress = 1.0;
+                self.import_current_filename = "Done".to_string();
+                self.import_current_operation = None;
+
+                self.state.blocking_write().message = if failure_count == 0 {
+                    format!("Imported {imported_files} file(s)")
+                } else if imported_files == 0 {
+                    match first_failure {
+                        Some(err) => format!("Import failed: {err}"),
+                        None => "Import failed".to_string(),
+                    }
+                } else {
+                    match first_failure {
+                        Some(err) => format!(
+                            "Imported {imported_files}/{total_files} file(s), {failure_count} failure(s). First error: {err}"
+                        ),
+                        None => format!(
+                            "Imported {imported_files}/{total_files} file(s), {failure_count} failure(s)"
+                        ),
+                    }
+                };
+            }
             Message::ImportPreparedAudioPeaks {
                 ref track_name,
                 ref clip_name,
@@ -8217,21 +8484,10 @@ impl Maolan {
                 };
                 let should_request = matches!(state.view, View::Video);
                 drop(state);
-                if should_request {
-                    let sample = self.transport_samples.max(0.0) as usize;
-                    let track_name = {
-                        let state = self.state.blocking_read();
-                        let selected_name = state.selected.iter().next().cloned();
-                        selected_name
-                            .as_ref()
-                            .and_then(|name| state.tracks.iter().find(|track| &track.name == name))
-                            .or_else(|| state.tracks.iter().find(|track| track.video.is_some()))
-                            .map(|track| track.name.clone())
-                    };
-                    if let Some(track_name) = track_name {
-                        return self
-                            .send(Action::RequestTrackVideoCurrentFrame { track_name, sample });
-                    }
+                if !should_request {
+                    self.last_video_preview_request = None;
+                } else if let Some(task) = self.request_visible_video_preview_frame(true) {
+                    return task;
                 }
             }
             Message::ToggleMixerVisibility => {

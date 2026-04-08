@@ -153,7 +153,8 @@ impl Maolan {
                 if !tasks.is_empty() {
                     return Task::batch(tasks);
                 }
-                Task::none()
+                self.request_visible_video_preview_frame(false)
+                    .unwrap_or_else(Task::none)
             }
             Message::AutosaveSnapshotTick => {
                 if !self.has_unsaved_changes

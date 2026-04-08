@@ -804,6 +804,12 @@ pub enum Message {
         filename: String,
         operation: Option<String>,
     },
+    ImportFinished {
+        total_files: usize,
+        imported_files: usize,
+        failure_count: usize,
+        first_failure: Option<String>,
+    },
     ImportPreparedAudioPeaks {
         track_name: String,
         clip_name: String,

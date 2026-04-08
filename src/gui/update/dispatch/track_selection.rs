@@ -72,7 +72,8 @@ impl Maolan {
                     set.insert(name.clone());
                     state.connection_view_selection = ConnectionViewSelection::Tracks(set);
                 }
-                None
+                drop(state);
+                self.request_visible_video_preview_frame(true)
             }
             Message::SelectTrackFromMixer(ref name) => {
                 let ctrl = self.state.blocking_read().ctrl;
@@ -98,7 +99,8 @@ impl Maolan {
                     set.insert(name.clone());
                     state.connection_view_selection = ConnectionViewSelection::Tracks(set);
                 }
-                None
+                drop(state);
+                self.request_visible_video_preview_frame(true)
             }
             _ => None,
         }

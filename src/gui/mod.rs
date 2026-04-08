@@ -434,6 +434,7 @@ pub struct Maolan {
     video_preview_resize_hovered: bool,
     video_preview_split_resize_hovered: bool,
     video_preview_split_secondary_resize_hovered: bool,
+    last_video_preview_request: Option<(String, usize, Instant)>,
     tracks_visible: bool,
     editor_visible: bool,
     mixer_visible: bool,
@@ -693,6 +694,7 @@ impl Default for Maolan {
             video_preview_resize_hovered: false,
             video_preview_split_resize_hovered: false,
             video_preview_split_secondary_resize_hovered: false,
+            last_video_preview_request: None,
             tracks_visible: true,
             editor_visible: true,
             mixer_visible: true,
@@ -2314,15 +2316,11 @@ impl Maolan {
         Ok((rel, channels.max(1), frames.max(1), peaks))
     }
 
-    async fn import_embedded_video_audio_to_session_wav_with_progress<F>(
+    fn import_embedded_video_audio_to_session_wav(
         src_path: &Path,
         session_root: &Path,
         target_sample_rate: u32,
-        mut progress_callback: F,
-    ) -> std::io::Result<(String, usize, usize, ClipPeaks)>
-    where
-        F: FnMut(f32, Option<String>),
-    {
+    ) -> std::io::Result<(String, usize, usize, ClipPeaks)> {
         Self::ffmpeg_init().map_err(|e| io::Error::other(format!("FFmpeg init failed: {e}")))?;
         let stem = src_path
             .file_stem()
@@ -2330,56 +2328,321 @@ impl Maolan {
             .unwrap_or("audio");
         let rel = Self::unique_import_rel_path(session_root, "audio", stem, "wav")?;
         let dst = session_root.join(&rel);
-
-        progress_callback(0.05, Some("Extracting embedded audio".to_string()));
-        tokio::task::yield_now().await;
-
-        let output = Command::new("ffmpeg")
-            .arg("-y")
-            .arg("-i")
-            .arg(src_path)
-            .arg("-vn")
-            .arg("-acodec")
-            .arg("pcm_f32le")
-            .arg("-ar")
-            .arg(target_sample_rate.to_string())
-            .arg("-ac")
-            .arg("2")
-            .arg(&dst)
-            .output()
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "Failed to launch ffmpeg for embedded audio extraction '{}': {e}",
-                    src_path.display()
-                ))
+        let mut input = ffmpeg_next::format::input(src_path).map_err(|e| {
+            io::Error::other(format!(
+                "Failed to open video '{}': {e}",
+                src_path.display()
+            ))
+        })?;
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Audio)
+            .ok_or_else(|| {
+                io::Error::other(format!("No audio stream found in '{}'", src_path.display()))
             })?;
-        if !output.status.success() {
+        let stream_index = stream.index();
+        let context = ffmpeg_next::codec::Context::from_parameters(stream.parameters())
+            .map_err(|e| io::Error::other(format!("Audio codec params failed: {e}")))?;
+        let mut decoder = context
+            .decoder()
+            .audio()
+            .map_err(|e| io::Error::other(format!("Audio decoder open failed: {e}")))?;
+
+        let decoder_channel_layout = {
+            let layout = decoder.channel_layout();
+            if layout.is_empty() {
+                match decoder.channels() {
+                    1 => ffmpeg_next::channel_layout::ChannelLayout::MONO,
+                    _ => ffmpeg_next::channel_layout::ChannelLayout::STEREO,
+                }
+            } else {
+                layout
+            }
+        };
+        let mut output_channel_layout = decoder_channel_layout;
+        let mut channels = output_channel_layout.channels().max(1) as usize;
+        let mut input_format = decoder.format();
+        let mut input_rate = decoder.rate();
+        let mut input_channel_layout = decoder_channel_layout;
+        let mut resampler = ffmpeg_next::software::resampling::Context::get(
+            input_format,
+            input_channel_layout,
+            input_rate,
+            ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar),
+            output_channel_layout,
+            target_sample_rate,
+        )
+        .map_err(|e| io::Error::other(format!("Audio resampler init failed: {e}")))?;
+
+        let mut decoded = Audio::empty();
+        let mut converted = Audio::empty();
+        let mut samples = Vec::<f32>::new();
+
+        let mut append_frame = |frame: &Audio, channels: usize| {
+            let frame_samples = frame.samples();
+            for sample_index in 0..frame_samples {
+                for channel in 0..channels {
+                    let plane = frame.data(channel);
+                    let data_ptr = plane.as_ptr() as *const f32;
+                    unsafe {
+                        samples.push(*data_ptr.add(sample_index));
+                    }
+                }
+            }
+        };
+
+        for (packet_stream, packet) in input.packets() {
+            if packet_stream.index() != stream_index {
+                continue;
+            }
+            decoder
+                .send_packet(&packet)
+                .map_err(|e| io::Error::other(format!("Send audio packet failed: {e}")))?;
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                let decoded_layout = {
+                    let layout = decoded.channel_layout();
+                    if layout.is_empty() {
+                        match decoded.channels() {
+                            1 => ffmpeg_next::channel_layout::ChannelLayout::MONO,
+                            _ => ffmpeg_next::channel_layout::ChannelLayout::STEREO,
+                        }
+                    } else {
+                        layout
+                    }
+                };
+                if decoded.format() != input_format
+                    || decoded.rate() != input_rate
+                    || decoded_layout != input_channel_layout
+                {
+                    input_format = decoded.format();
+                    input_rate = decoded.rate();
+                    input_channel_layout = decoded_layout;
+                    output_channel_layout = decoded_layout;
+                    channels = output_channel_layout.channels().max(1) as usize;
+                    resampler = ffmpeg_next::software::resampling::Context::get(
+                        input_format,
+                        input_channel_layout,
+                        input_rate,
+                        ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar),
+                        output_channel_layout,
+                        target_sample_rate,
+                    )
+                    .map_err(|e| io::Error::other(format!("Audio resampler reinit failed: {e}")))?;
+                }
+                let dst_format =
+                    ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar);
+                let mut out_samples = unsafe {
+                    ffmpeg_next::ffi::swr_get_out_samples(
+                        resampler.as_mut_ptr(),
+                        decoded.samples() as i32,
+                    )
+                };
+                if out_samples < 0 {
+                    return Err(io::Error::other("swr_get_out_samples failed"));
+                }
+                if out_samples == 0 {
+                    out_samples = decoded.samples() as i32;
+                }
+                converted = Audio::new(dst_format, out_samples as usize, output_channel_layout);
+                converted.set_rate(target_sample_rate);
+                let converted_samples = unsafe {
+                    ffmpeg_next::ffi::swr_convert(
+                        resampler.as_mut_ptr(),
+                        (*converted.as_mut_ptr()).extended_data,
+                        out_samples,
+                        (*decoded.as_ptr()).extended_data as *mut *const u8,
+                        decoded.samples() as i32,
+                    )
+                };
+                if converted_samples < 0 {
+                    let err = ffmpeg_next::Error::from(converted_samples);
+                    if err.to_string().contains("Input changed") {
+                        input_format = decoded.format();
+                        input_rate = decoded.rate();
+                        input_channel_layout = decoded_layout;
+                        output_channel_layout = decoded_layout;
+                        channels = output_channel_layout.channels().max(1) as usize;
+                        resampler = ffmpeg_next::software::resampling::Context::get(
+                            input_format,
+                            input_channel_layout,
+                            input_rate,
+                            dst_format,
+                            output_channel_layout,
+                            target_sample_rate,
+                        )
+                        .map_err(|reinit_err| {
+                            io::Error::other(format!("Audio resampler reinit failed: {reinit_err}"))
+                        })?;
+                        let retry_out_samples = unsafe {
+                            ffmpeg_next::ffi::swr_get_out_samples(
+                                resampler.as_mut_ptr(),
+                                decoded.samples() as i32,
+                            )
+                        };
+                        if retry_out_samples < 0 {
+                            return Err(io::Error::other("swr_get_out_samples retry failed"));
+                        }
+                        converted = Audio::new(
+                            dst_format,
+                            retry_out_samples as usize,
+                            output_channel_layout,
+                        );
+                        converted.set_rate(target_sample_rate);
+                        let retry_result = unsafe {
+                            ffmpeg_next::ffi::swr_convert(
+                                resampler.as_mut_ptr(),
+                                (*converted.as_mut_ptr()).extended_data,
+                                retry_out_samples,
+                                (*decoded.as_ptr()).extended_data as *mut *const u8,
+                                decoded.samples() as i32,
+                            )
+                        };
+                        if retry_result < 0 {
+                            return Err(io::Error::other(format!(
+                                "Audio resample failed after reinit: {}",
+                                ffmpeg_next::Error::from(retry_result)
+                            )));
+                        }
+                        converted.set_samples(retry_result as usize);
+                    } else {
+                        return Err(io::Error::other(format!("Audio resample failed: {err}")));
+                    }
+                } else {
+                    converted.set_samples(converted_samples as usize);
+                }
+                append_frame(&converted, channels);
+            }
+        }
+        decoder
+            .send_eof()
+            .map_err(|e| io::Error::other(format!("Audio decoder EOF failed: {e}")))?;
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            let decoded_layout = {
+                let layout = decoded.channel_layout();
+                if layout.is_empty() {
+                    match decoded.channels() {
+                        1 => ffmpeg_next::channel_layout::ChannelLayout::MONO,
+                        _ => ffmpeg_next::channel_layout::ChannelLayout::STEREO,
+                    }
+                } else {
+                    layout
+                }
+            };
+            if decoded.format() != input_format
+                || decoded.rate() != input_rate
+                || decoded_layout != input_channel_layout
+            {
+                input_format = decoded.format();
+                input_rate = decoded.rate();
+                input_channel_layout = decoded_layout;
+                output_channel_layout = decoded_layout;
+                channels = output_channel_layout.channels().max(1) as usize;
+                resampler = ffmpeg_next::software::resampling::Context::get(
+                    input_format,
+                    input_channel_layout,
+                    input_rate,
+                    ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar),
+                    output_channel_layout,
+                    target_sample_rate,
+                )
+                .map_err(|e| io::Error::other(format!("Audio resampler reinit failed: {e}")))?;
+            }
+            let dst_format =
+                ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar);
+            let mut out_samples = unsafe {
+                ffmpeg_next::ffi::swr_get_out_samples(
+                    resampler.as_mut_ptr(),
+                    decoded.samples() as i32,
+                )
+            };
+            if out_samples < 0 {
+                return Err(io::Error::other("swr_get_out_samples failed"));
+            }
+            if out_samples == 0 {
+                out_samples = decoded.samples() as i32;
+            }
+            converted = Audio::new(dst_format, out_samples as usize, output_channel_layout);
+            converted.set_rate(target_sample_rate);
+            let converted_samples = unsafe {
+                ffmpeg_next::ffi::swr_convert(
+                    resampler.as_mut_ptr(),
+                    (*converted.as_mut_ptr()).extended_data,
+                    out_samples,
+                    (*decoded.as_ptr()).extended_data as *mut *const u8,
+                    decoded.samples() as i32,
+                )
+            };
+            if converted_samples < 0 {
+                let err = ffmpeg_next::Error::from(converted_samples);
+                if err.to_string().contains("Input changed") {
+                    input_format = decoded.format();
+                    input_rate = decoded.rate();
+                    input_channel_layout = decoded_layout;
+                    output_channel_layout = decoded_layout;
+                    channels = output_channel_layout.channels().max(1) as usize;
+                    resampler = ffmpeg_next::software::resampling::Context::get(
+                        input_format,
+                        input_channel_layout,
+                        input_rate,
+                        dst_format,
+                        output_channel_layout,
+                        target_sample_rate,
+                    )
+                    .map_err(|reinit_err| {
+                        io::Error::other(format!("Audio resampler reinit failed: {reinit_err}"))
+                    })?;
+                    let retry_out_samples = unsafe {
+                        ffmpeg_next::ffi::swr_get_out_samples(
+                            resampler.as_mut_ptr(),
+                            decoded.samples() as i32,
+                        )
+                    };
+                    if retry_out_samples < 0 {
+                        return Err(io::Error::other("swr_get_out_samples retry failed"));
+                    }
+                    converted = Audio::new(
+                        dst_format,
+                        retry_out_samples as usize,
+                        output_channel_layout,
+                    );
+                    converted.set_rate(target_sample_rate);
+                    let retry_result = unsafe {
+                        ffmpeg_next::ffi::swr_convert(
+                            resampler.as_mut_ptr(),
+                            (*converted.as_mut_ptr()).extended_data,
+                            retry_out_samples,
+                            (*decoded.as_ptr()).extended_data as *mut *const u8,
+                            decoded.samples() as i32,
+                        )
+                    };
+                    if retry_result < 0 {
+                        return Err(io::Error::other(format!(
+                            "Audio resample failed after reinit: {}",
+                            ffmpeg_next::Error::from(retry_result)
+                        )));
+                    }
+                    converted.set_samples(retry_result as usize);
+                } else {
+                    return Err(io::Error::other(format!("Audio resample failed: {err}")));
+                }
+            } else {
+                converted.set_samples(converted_samples as usize);
+            }
+            append_frame(&converted, channels);
+        }
+
+        if samples.is_empty() {
             return Err(io::Error::other(format!(
-                "ffmpeg embedded audio extraction failed for '{}': {}",
-                src_path.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
+                "Embedded audio stream '{}' produced no samples",
+                src_path.display()
             )));
         }
 
-        progress_callback(0.85, Some("Reading".to_string()));
-        tokio::task::yield_now().await;
-        let (channels, frames) = {
-            let wav = Wav::<f32>::from_path(&dst).map_err(|e| {
-                io::Error::other(format!(
-                    "Failed to read extracted WAV '{}': {e}",
-                    dst.display()
-                ))
-            })?;
-            let channels = usize::from(wav.n_channels()).max(1);
-            let frames = wav.n_samples() / channels.max(1);
-            (channels, frames)
-        };
+        wavers::write::<f32, _>(&dst, &samples, target_sample_rate as i32, channels as u16)
+            .map_err(|e| io::Error::other(format!("Failed to write '{}': {e}", dst.display())))?;
 
-        progress_callback(0.95, Some("Calculating peaks".to_string()));
-        tokio::task::yield_now().await;
+        let frames = samples.len() / channels.max(1);
         let peaks = Self::compute_audio_clip_peaks(&dst)?;
-
-        progress_callback(1.0, None);
         Ok((rel, channels.max(1), frames.max(1), peaks))
     }
 
@@ -2409,21 +2672,100 @@ impl Maolan {
     }
 
     fn import_video_to_session(src_path: &Path, session_root: &Path) -> io::Result<String> {
+        Self::ffmpeg_init().map_err(|e| io::Error::other(format!("FFmpeg init failed: {e}")))?;
         let stem = src_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("video");
-        let ext = Self::file_extension_lower(src_path).unwrap_or_else(|| "mp4".to_string());
-        let rel = Self::unique_import_rel_path(session_root, "video", stem, &ext)?;
+        // Store imported video as Matroska to avoid container-specific remux failures
+        // when the source has sparse or missing timestamps.
+        let rel = Self::unique_import_rel_path(session_root, "video", stem, "mkv")?;
         let dst = session_root.join(&rel);
         fs::create_dir_all(session_root.join("video"))?;
-        fs::copy(src_path, &dst).map_err(|e| {
+        let mut input = ffmpeg_next::format::input(src_path).map_err(|e| {
             io::Error::other(format!(
-                "Failed to copy video '{}' to '{}': {e}",
-                src_path.display(),
-                dst.display()
+                "Failed to open video '{}': {e}",
+                src_path.display()
             ))
         })?;
+        let input_stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .ok_or_else(|| {
+                io::Error::other(format!("No video stream found in '{}'", src_path.display()))
+            })?;
+        let input_index = input_stream.index();
+        let input_time_base = input_stream.time_base();
+        let input_rate = {
+            let avg = input_stream.avg_frame_rate();
+            if avg.numerator() > 0 && avg.denominator() > 0 {
+                avg
+            } else {
+                let rate = input_stream.rate();
+                if rate.numerator() > 0 && rate.denominator() > 0 {
+                    rate
+                } else {
+                    ffmpeg_next::Rational(25, 1)
+                }
+            }
+        };
+        let estimated_packet_duration = {
+            let tb_num = f64::from(input_time_base.numerator().max(1));
+            let tb_den = f64::from(input_time_base.denominator().max(1));
+            let rate_num = f64::from(input_rate.numerator().max(1));
+            let rate_den = f64::from(input_rate.denominator().max(1));
+            ((rate_den / rate_num) / (tb_num / tb_den)).round().max(1.0) as i64
+        };
+
+        let mut output = output(dst.to_str().unwrap_or("video.mkv"))
+            .map_err(|e| io::Error::other(format!("Failed to create output context: {e}")))?;
+        let output_stream_index = {
+            let mut output_stream = output
+                .add_stream(ffmpeg_next::codec::encoder::find(CodecId::None))
+                .map_err(|e| io::Error::other(format!("Failed to add output stream: {e}")))?;
+            output_stream.set_parameters(input_stream.parameters());
+            unsafe {
+                (*output_stream.parameters().as_mut_ptr()).codec_tag = 0;
+            }
+            output_stream.index()
+        };
+        output.set_metadata(input.metadata().to_owned());
+
+        output
+            .write_header()
+            .map_err(|e| io::Error::other(format!("Failed to write video header: {e}")))?;
+
+        let mut next_packet_ts = 0_i64;
+        for (packet_stream, mut packet) in input.packets() {
+            if packet_stream.index() != input_index {
+                continue;
+            }
+            let packet_duration = if packet.duration() > 0 {
+                packet.duration()
+            } else {
+                estimated_packet_duration
+            };
+            let pts = packet.pts().unwrap_or(next_packet_ts);
+            let dts = packet.dts().unwrap_or(pts);
+            packet.set_pts(Some(pts));
+            packet.set_dts(Some(dts));
+            packet.set_duration(packet_duration);
+            packet.set_position(-1);
+            packet.set_stream(output_stream_index);
+            let output_stream_time_base = output
+                .stream(output_stream_index)
+                .map(|stream| stream.time_base())
+                .unwrap_or(input_time_base);
+            packet.rescale_ts(input_time_base, output_stream_time_base);
+            packet
+                .write_interleaved(&mut output)
+                .map_err(|e| io::Error::other(format!("Failed to write video packet: {e}")))?;
+            next_packet_ts = pts.saturating_add(packet_duration);
+        }
+
+        output
+            .write_trailer()
+            .map_err(|e| io::Error::other(format!("Failed to finalize video file: {e}")))?;
         Ok(rel)
     }
 
