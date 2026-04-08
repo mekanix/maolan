@@ -101,7 +101,7 @@ impl Maolan {
                 track_name: track_name.clone(),
             }));
         }
-        if force || needs_current_frame {
+        if force || needs_current_frame || view_is_video {
             tasks.push(self.send(Action::RequestTrackVideoCurrentFrame { track_name, sample }));
         }
         if tasks.is_empty() {

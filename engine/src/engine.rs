@@ -168,7 +168,7 @@ enum MidiLearnSlot {
 }
 
 pub struct Engine {
-    clients: Vec<Sender<Message>>,
+    clients: Arc<UnsafeMutex<Vec<Sender<Message>>>>,
     rx: Receiver<Message>,
     state: Arc<UnsafeMutex<State>>,
     tx: Sender<Message>,
@@ -273,7 +273,7 @@ impl Engine {
         resolved_clip
     }
 
-    fn request_track_video_frame(&self, track_name: &str) {
+    async fn request_track_video_frame(&mut self, track_name: &str) {
         let Some(track_handle) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
         };
@@ -285,90 +285,131 @@ impl Engine {
             (clip, track.sample_rate)
         };
         let clip = self.resolve_video_clip_data(&clip);
-
-        let tx = self.tx.clone();
-        let track_name = track_name.to_string();
-        tokio::spawn(async move {
-            match video::decode_iframe_preview_strip(&clip, sample_rate) {
-                Ok(buffer) => {
-                    let _ = tx
-                        .send(Message::Response(Ok(Action::TrackVideoFrame {
-                            track_name,
-                            buffer,
-                            clip,
-                        })))
-                        .await;
-                }
-                Err(err) => {
-                    let _ = tx.send(Message::Response(Err(err))).await;
-                }
-            }
-        });
+        let Some(worker_index) = self.take_ready_worker_index() else {
+            self.pending_requests
+                .push_back(Action::RequestTrackVideoFrame {
+                    track_name: track_name.to_string(),
+                });
+            return;
+        };
+        let worker = &self.workers[worker_index];
+        if let Err(e) = worker
+            .tx
+            .send(Message::ProcessVideoDecode(
+                crate::message::VideoDecodeJob::Preview {
+                    track_name: track_name.to_string(),
+                    clip,
+                    sample_rate,
+                },
+            ))
+            .await
+        {
+            self.notify_clients(Err(format!("Failed to schedule video preview decode: {e}")))
+                .await;
+        }
     }
 
-    fn request_track_video_current_frame(&self, track_name: &str, sample: usize) {
+    async fn request_track_video_current_frame(&mut self, track_name: &str, sample: usize) {
         let Some(track_handle) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
         };
-        let (clip, sample_rate) = {
+        let (clip, sample_rate, generation) = {
             let track = track_handle.lock();
             let Some(clip) = track.video_clip.clone() else {
                 return;
             };
-            (clip, track.sample_rate)
+            if track.video_current_frame_inflight {
+                track.video_pending_sample = Some(sample);
+                return;
+            }
+            (clip, track.sample_rate, track.video_decode_generation)
         };
         let clip = self.resolve_video_clip_data(&clip);
-
-        let tx = self.tx.clone();
-        let track_name = track_name.to_string();
-        tokio::spawn(async move {
-            match video::decode_frame_at_sample(&clip, sample_rate, sample) {
-                Ok(buffer) => {
-                    let _ = tx
-                        .send(Message::Response(Ok(Action::TrackVideoCurrentFrame {
-                            track_name,
-                            buffer,
-                            clip,
-                        })))
+        {
+            let track = track_handle.lock();
+            if track.video_decoder.is_none() {
+                match video::VideoDecoderState::new(clip.clone(), sample_rate) {
+                    Ok(decoder) => {
+                        track.video_decoder = Some(Arc::new(UnsafeMutex::new(decoder)));
+                    }
+                    Err(err) => {
+                        self.notify_clients(Err(format!(
+                            "Failed to initialize video decoder for '{}': {err}",
+                            track_name
+                        )))
                         .await;
-                }
-                Err(err) => {
-                    let _ = tx.send(Message::Response(Err(err))).await;
+                        return;
+                    }
                 }
             }
-        });
+        }
+        let Some(worker_index) = self.take_ready_worker_index() else {
+            track_handle.lock().video_pending_sample = Some(sample);
+            return;
+        };
+        {
+            let track = track_handle.lock();
+            track.video_current_frame_inflight = true;
+            track.video_pending_sample = None;
+        }
+        let worker = &self.workers[worker_index];
+        if let Err(e) = worker
+            .tx
+            .send(Message::ProcessVideoDecode(
+                crate::message::VideoDecodeJob::CurrentFrame {
+                    track_name: track_name.to_string(),
+                    clip,
+                    sample_rate,
+                    sample,
+                    generation,
+                },
+            ))
+            .await
+        {
+            let track = track_handle.lock();
+            track.video_current_frame_inflight = false;
+            track.video_pending_sample = Some(sample);
+            self.notify_clients(Err(format!(
+                "Failed to schedule current video frame decode: {e}"
+            )))
+            .await;
+        }
     }
 
-    fn maybe_push_video_current_frames(&self, force: bool) {
-        let current_sample = self.transport_sample;
-        let due_tracks = {
-            let state = self.state.lock();
-            state
-                .tracks
-                .iter()
-                .filter_map(|(track_name, track_handle)| {
-                    let track = track_handle.lock();
-                    track.video_clip.as_ref()?;
-                    let interval = track.video_frame_interval_samples.max(1);
-                    let should_push = force
-                        || track.video_current_frame.is_none()
-                        || track.video_last_push_sample.is_none()
-                        || track
-                            .video_last_push_sample
-                            .is_some_and(|last| current_sample < last)
-                        || track
-                            .video_last_push_sample
-                            .is_some_and(|last| current_sample.abs_diff(last) >= interval);
-                    should_push.then_some(track_name.clone())
+    async fn schedule_pending_video_decode_work(&mut self) {
+        while !self.ready_workers.is_empty() {
+            let pending_current = {
+                self.state.lock().tracks.iter().find_map(|(name, track)| {
+                    let track = track.lock();
+                    (!track.video_current_frame_inflight)
+                        .then_some(
+                            track
+                                .video_pending_sample
+                                .map(|sample| (name.clone(), sample)),
+                        )
+                        .flatten()
                 })
-                .collect::<Vec<_>>()
-        };
+            };
 
-        for track_name in due_tracks {
-            if let Some(track_handle) = self.state.lock().tracks.get(&track_name).cloned() {
-                track_handle.lock().video_last_push_sample = Some(current_sample);
+            if let Some((track_name, sample)) = pending_current {
+                self.request_track_video_current_frame(&track_name, sample)
+                    .await;
+                continue;
             }
-            self.request_track_video_current_frame(&track_name, current_sample);
+
+            let pending_preview_index = self
+                .pending_requests
+                .iter()
+                .position(|action| matches!(action, Action::RequestTrackVideoFrame { .. }));
+            let Some(pending_preview_index) = pending_preview_index else {
+                break;
+            };
+            let Some(Action::RequestTrackVideoFrame { track_name }) =
+                self.pending_requests.remove(pending_preview_index)
+            else {
+                continue;
+            };
+            self.request_track_video_frame(&track_name).await;
         }
     }
 
@@ -998,7 +1039,7 @@ impl Engine {
         Self {
             rx,
             tx,
-            clients: vec![],
+            clients: Arc::new(UnsafeMutex::new(vec![])),
             state: Arc::new(UnsafeMutex::new(State::default())),
             workers: vec![],
             hw_driver: None,
@@ -1408,7 +1449,6 @@ impl Engine {
             self.transport_sample = sample;
             self.notify_clients(Ok(Action::TransportPosition(self.transport_sample)))
                 .await;
-            self.maybe_push_video_current_frames(true);
         }
     }
 
@@ -2745,8 +2785,10 @@ impl Engine {
         for id in 0..max_threads {
             let (tx, rx) = channel::<Message>(32);
             let tx_thread = self.tx.clone();
+            let state = self.state.clone();
+            let clients = self.clients.clone();
             let handler = tokio::spawn(async move {
-                let wrk = Worker::new(id, rx, tx_thread);
+                let wrk = Worker::new(id, rx, tx_thread, state, clients);
                 wrk.await.work().await;
             });
             self.workers.push(WorkerData::new(tx.clone(), handler));
@@ -2754,7 +2796,8 @@ impl Engine {
     }
 
     async fn notify_clients(&self, action: Result<Action, String>) {
-        for client in &self.clients {
+        let clients = self.clients.lock().clone();
+        for client in &clients {
             client
                 .send(Message::Response(action.clone()))
                 .await
@@ -3762,7 +3805,6 @@ impl Engine {
                         }
                     }
                 }
-                self.maybe_push_video_current_frames(true);
             }
             Action::SetLoopEnabled(enabled) => {
                 self.loop_enabled = enabled && self.loop_range_samples.is_some();
@@ -4233,13 +4275,14 @@ impl Engine {
                 }
             }
             Action::RequestTrackVideoFrame { ref track_name } => {
-                self.request_track_video_frame(track_name);
+                self.request_track_video_frame(track_name).await;
             }
             Action::RequestTrackVideoCurrentFrame {
                 ref track_name,
                 sample,
             } => {
-                self.request_track_video_current_frame(track_name, sample);
+                self.request_track_video_current_frame(track_name, sample)
+                    .await;
             }
             Action::TrackToggleArm(ref name) => {
                 if self.reject_if_track_frozen(name, "arming/disarming").await {
@@ -5649,7 +5692,11 @@ impl Engine {
                 track.has_video = track.has_video || clip.is_some();
                 track.video_frame = None;
                 track.video_current_frame = None;
+                track.video_decoder = None;
                 track.video_last_push_sample = None;
+                track.video_current_frame_inflight = false;
+                track.video_pending_sample = None;
+                track.video_decode_generation = track.video_decode_generation.wrapping_add(1);
                 track.video_frame_interval_samples = clip
                     .as_ref()
                     .map(|clip| self.resolve_video_clip_data(clip))
@@ -5658,8 +5705,7 @@ impl Engine {
                     })
                     .unwrap_or_else(|| track.sample_rate.max(1.0).round() as usize);
                 if clip.is_some() {
-                    self.request_track_video_frame(track_name);
-                    self.request_track_video_current_frame(track_name, self.transport_sample);
+                    self.request_track_video_frame(track_name).await;
                 }
             }
             Action::RemoveClip {
@@ -6459,6 +6505,7 @@ impl Engine {
             match message {
                 Message::Ready(id) => {
                     self.ready_workers.push(id);
+                    self.schedule_pending_video_decode_work().await;
                 }
                 Message::Finished {
                     worker_id,
@@ -6518,8 +6565,11 @@ impl Engine {
                         self.request_hw_cycle().await;
                     }
                 }
+                Message::VideoDecodeFinished { worker_id, .. } => {
+                    self.ready_workers.push(worker_id);
+                }
                 Message::Channel(s) => {
-                    self.clients.push(s);
+                    self.clients.lock().push(s);
                 }
                 Message::Response(result) => match result {
                     Ok(action) => {
@@ -6676,7 +6726,6 @@ impl Engine {
                                 )))
                                 .await;
                             }
-                            self.maybe_push_video_current_frames(false);
                         }
                     }
                     if self.send_tracks().await && self.hw_worker.is_some() {
@@ -6838,9 +6887,9 @@ mod tests {
 
     fn make_engine_with_client() -> (Engine, tokio::sync::mpsc::Receiver<Message>) {
         let (engine_tx, engine_rx) = channel(16);
-        let mut engine = Engine::new(engine_rx, engine_tx);
+        let engine = Engine::new(engine_rx, engine_tx);
         let (client_tx, client_rx) = channel(16);
-        engine.clients.push(client_tx);
+        engine.clients.lock().push(client_tx);
         (engine, client_rx)
     }
 

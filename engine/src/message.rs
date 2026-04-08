@@ -147,6 +147,38 @@ pub struct VideoFrameBuffer {
 }
 
 #[derive(Clone, Debug)]
+pub enum VideoDecodeJob {
+    Preview {
+        track_name: String,
+        clip: VideoClipData,
+        sample_rate: f64,
+    },
+    CurrentFrame {
+        track_name: String,
+        clip: VideoClipData,
+        sample_rate: f64,
+        sample: usize,
+        generation: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum VideoDecodeResult {
+    Preview {
+        track_name: String,
+        clip: VideoClipData,
+        result: Result<Arc<UnsafeMutex<VideoFrameBuffer>>, String>,
+    },
+    CurrentFrame {
+        track_name: String,
+        clip: VideoClipData,
+        sample: usize,
+        generation: u64,
+        result: Result<Arc<UnsafeMutex<VideoFrameBuffer>>, String>,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub struct ClipMoveFrom {
     pub track_name: String,
     pub clip_index: usize,
@@ -903,6 +935,7 @@ pub enum Message {
 
     ProcessTrack(Arc<UnsafeMutex<Box<Track>>>),
     ProcessOfflineBounce(OfflineBounceWork),
+    ProcessVideoDecode(VideoDecodeJob),
     Channel(Sender<Self>),
 
     Request(Action),
@@ -913,6 +946,10 @@ pub enum Message {
     HWFinished,
     OfflineBounceFinished {
         result: Result<Action, String>,
+    },
+    VideoDecodeFinished {
+        worker_id: usize,
+        result: VideoDecodeResult,
     },
 }
 

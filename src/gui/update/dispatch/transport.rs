@@ -131,6 +131,9 @@ impl Maolan {
                         }));
                     }
                 }
+                if let Some(task) = self.request_visible_video_preview_frame(false) {
+                    tasks.push(task);
+                }
                 if self.playing && !self.paused {
                     let tracks = {
                         let state = self.state.blocking_read();
