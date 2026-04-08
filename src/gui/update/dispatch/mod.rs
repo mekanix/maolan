@@ -17,7 +17,6 @@ mod transport;
 mod ui;
 
 const CLIP_EDGE_SNAP_THRESHOLD_PX: f32 = 12.0;
-const VIDEO_PREVIEW_FPS: f64 = 12.0;
 
 struct MoveClipSnapArgs<'a> {
     kind: Kind,
@@ -47,7 +46,14 @@ impl Maolan {
         &mut self,
         force: bool,
     ) -> Option<Task<Message>> {
-        let (view_is_video, track_name, needs_preview_frame, needs_current_frame) = {
+        let (
+            view_is_video,
+            track_name,
+            needs_preview_frame,
+            needs_current_frame,
+            min_sample_delta,
+            min_request_interval,
+        ) = {
             let state = self.state.blocking_read();
             let selected_name = state.selected.iter().next().cloned();
             let track = selected_name
@@ -66,11 +72,19 @@ impl Maolan {
             let needs_current_frame = track
                 .and_then(|track| track.video.as_ref())
                 .is_some_and(|video| video.current_frame.is_none());
+            let min_sample_delta = track
+                .and_then(|track| track.video.as_ref())
+                .map(|video| video.frame_interval_samples.max(1))
+                .unwrap_or(1);
+            let min_request_interval =
+                Duration::from_secs_f64(min_sample_delta as f64 / self.playback_rate_hz.max(1.0));
             (
                 matches!(state.view, View::Video) || state.video_preview_visible,
                 track_name,
                 needs_preview_frame,
                 needs_current_frame,
+                min_sample_delta,
+                min_request_interval,
             )
         };
         if !view_is_video {
@@ -83,13 +97,12 @@ impl Maolan {
         };
 
         let sample = self.transport_samples.max(0.0) as usize;
-        let min_sample_delta = (self.playback_rate_hz / VIDEO_PREVIEW_FPS).max(1.0) as usize;
         let now = Instant::now();
         if !force
             && let Some((last_track_name, last_sample, last_at)) = &self.last_video_preview_request
             && *last_track_name == track_name
             && sample.abs_diff(*last_sample) < min_sample_delta
-            && now.duration_since(*last_at) < Duration::from_millis(75)
+            && now.duration_since(*last_at) < min_request_interval
         {
             return None;
         }

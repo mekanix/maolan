@@ -34,7 +34,7 @@ pub fn discover_coreaudio_devices() -> Vec<String> {
 }
 
 pub fn init() -> (Sender<message::Message>, JoinHandle<()>) {
-    let (tx, rx) = channel::<message::Message>(32);
+    let (tx, rx) = channel::<message::Message>(256);
     let mut engine = engine::Engine::new(rx, tx.clone());
     let handle = tokio::spawn(async move {
         engine.init().await;

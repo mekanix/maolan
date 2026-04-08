@@ -370,10 +370,18 @@ impl Worker {
                             }
                         };
                         if should_publish {
+                            let interval_samples = self
+                                .state
+                                .lock()
+                                .tracks
+                                .get(&track_name)
+                                .map(|track| track.lock().video_frame_interval_samples)
+                                .unwrap_or(1);
                             self.try_notify_clients_video(Action::TrackVideoFrame {
                                 track_name,
                                 buffer,
                                 clip,
+                                interval_samples,
                             });
                         }
                     }
@@ -446,6 +454,13 @@ impl Worker {
                             track_name: track_name.clone(),
                             buffer,
                             clip: clip.clone(),
+                            interval_samples: self
+                                .state
+                                .lock()
+                                .tracks
+                                .get(&track_name)
+                                .map(|track| track.lock().video_frame_interval_samples)
+                                .unwrap_or(1),
                         });
                         if let Some(next_sample) = next_sample {
                             sample = next_sample;

@@ -462,6 +462,7 @@ pub enum Action {
         track_name: String,
         buffer: Arc<UnsafeMutex<VideoFrameBuffer>>,
         clip: VideoClipData,
+        interval_samples: usize,
     },
     RequestTrackVideoFrame {
         track_name: String,
@@ -474,6 +475,7 @@ pub enum Action {
         track_name: String,
         buffer: Arc<UnsafeMutex<VideoFrameBuffer>>,
         clip: VideoClipData,
+        interval_samples: usize,
     },
     TrackToggleArm(String),
     TrackToggleMute(String),

@@ -23,7 +23,7 @@ impl Default for Client {
 
 impl Client {
     pub async fn subscribe(&self) -> Receiver<Message> {
-        let (tx, rx) = channel::<Message>(32);
+        let (tx, rx) = channel::<Message>(256);
         self.sender
             .send(Message::Channel(tx))
             .await

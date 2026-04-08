@@ -2783,7 +2783,7 @@ impl Engine {
     pub async fn init(&mut self) {
         let max_threads = num_cpus::get();
         for id in 0..max_threads {
-            let (tx, rx) = channel::<Message>(32);
+            let (tx, rx) = channel::<Message>(256);
             let tx_thread = self.tx.clone();
             let state = self.state.clone();
             let clients = self.clients.clone();

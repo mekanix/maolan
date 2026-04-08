@@ -58,6 +58,8 @@ pub struct VideoClip {
     pub start: usize,
     pub length: usize,
     pub offset: usize,
+    #[serde(default)]
+    pub frame_interval_samples: usize,
     #[serde(skip, default)]
     pub frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
     #[serde(skip, default)]
