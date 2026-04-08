@@ -509,6 +509,7 @@ pub struct Track {
 impl Track {
     const METRONOME_DEFAULT_LEVEL_DB: f32 = -10.0;
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         audio_ins: usize,

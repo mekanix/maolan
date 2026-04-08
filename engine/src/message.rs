@@ -431,6 +431,9 @@ pub enum Action {
         buffer: Arc<UnsafeMutex<VideoFrameBuffer>>,
         clip: VideoClipData,
     },
+    RequestTrackVideoFrame {
+        track_name: String,
+    },
     RequestTrackVideoCurrentFrame {
         track_name: String,
         sample: usize,

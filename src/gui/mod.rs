@@ -41,7 +41,9 @@ use ffmpeg_next::{
     Dictionary,
     codec::{Context as CodecContext, Id as CodecId},
     format::output,
-    frame::Audio,
+    frame::{Audio, Video},
+    software::scaling::{context::Context as ScalingContext, flag::Flags as ScalingFlags},
+    util::format::pixel::Pixel,
 };
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
@@ -2375,7 +2377,6 @@ impl Maolan {
         .map_err(|e| io::Error::other(format!("Audio resampler init failed: {e}")))?;
 
         let mut decoded = Audio::empty();
-        let mut converted = Audio::empty();
         let mut samples = Vec::<f32>::new();
 
         let mut append_frame = |frame: &Audio, channels: usize| {
@@ -2443,7 +2444,8 @@ impl Maolan {
                 if out_samples == 0 {
                     out_samples = decoded.samples() as i32;
                 }
-                converted = Audio::new(dst_format, out_samples as usize, output_channel_layout);
+                let mut converted =
+                    Audio::new(dst_format, out_samples as usize, output_channel_layout);
                 converted.set_rate(target_sample_rate);
                 let converted_samples = unsafe {
                     ffmpeg_next::ffi::swr_convert(
@@ -2561,7 +2563,7 @@ impl Maolan {
             if out_samples == 0 {
                 out_samples = decoded.samples() as i32;
             }
-            converted = Audio::new(dst_format, out_samples as usize, output_channel_layout);
+            let mut converted = Audio::new(dst_format, out_samples as usize, output_channel_layout);
             converted.set_rate(target_sample_rate);
             let converted_samples = unsafe {
                 ffmpeg_next::ffi::swr_convert(
@@ -2677,8 +2679,8 @@ impl Maolan {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("video");
-        // Store imported video as Matroska to avoid container-specific remux failures
-        // when the source has sparse or missing timestamps.
+        // Store imported video as Matroska with intra-only frames so scrubbing and
+        // rewind do not depend on inter-frame prediction.
         let rel = Self::unique_import_rel_path(session_root, "video", stem, "mkv")?;
         let dst = session_root.join(&rel);
         fs::create_dir_all(session_root.join("video"))?;
@@ -2695,8 +2697,7 @@ impl Maolan {
                 io::Error::other(format!("No video stream found in '{}'", src_path.display()))
             })?;
         let input_index = input_stream.index();
-        let input_time_base = input_stream.time_base();
-        let input_rate = {
+        let frame_rate = {
             let avg = input_stream.avg_frame_rate();
             if avg.numerator() > 0 && avg.denominator() > 0 {
                 avg
@@ -2709,58 +2710,150 @@ impl Maolan {
                 }
             }
         };
-        let estimated_packet_duration = {
-            let tb_num = f64::from(input_time_base.numerator().max(1));
-            let tb_den = f64::from(input_time_base.denominator().max(1));
-            let rate_num = f64::from(input_rate.numerator().max(1));
-            let rate_den = f64::from(input_rate.denominator().max(1));
-            ((rate_den / rate_num) / (tb_num / tb_den)).round().max(1.0) as i64
-        };
+        let frame_time_base = ffmpeg_next::Rational(
+            frame_rate.denominator().max(1),
+            frame_rate.numerator().max(1),
+        );
+        let decoder_context =
+            ffmpeg_next::codec::Context::from_parameters(input_stream.parameters())
+                .map_err(|e| io::Error::other(format!("Video codec params failed: {e}")))?;
+        let mut decoder = decoder_context
+            .decoder()
+            .video()
+            .map_err(|e| io::Error::other(format!("Video decoder open failed: {e}")))?;
+        let width = decoder.width().max(1);
+        let height = decoder.height().max(1);
+        let output_pixel_format = Pixel::YUV420P;
+        let mut scaler = ScalingContext::get(
+            decoder.format(),
+            width,
+            height,
+            output_pixel_format,
+            width,
+            height,
+            ScalingFlags::BILINEAR,
+        )
+        .map_err(|e| io::Error::other(format!("Video scaler init failed: {e}")))?;
+
+        let encoder_codec = ffmpeg_next::codec::encoder::find(CodecId::MPEG4)
+            .ok_or_else(|| io::Error::other("MPEG-4 video encoder not found"))?;
+        let mut encoder = CodecContext::new_with_codec(encoder_codec)
+            .encoder()
+            .video()
+            .map_err(|e| io::Error::other(format!("Failed to create video encoder: {e}")))?;
+        encoder.set_width(width);
+        encoder.set_height(height);
+        encoder.set_format(output_pixel_format);
+        encoder.set_time_base(frame_time_base);
+        encoder.set_frame_rate(Some(frame_rate));
+        encoder.set_gop(1);
+        encoder.set_max_b_frames(0);
+        let fps =
+            f64::from(frame_rate.numerator().max(1)) / f64::from(frame_rate.denominator().max(1));
+        let fallback_bit_rate = (((width as f64) * (height as f64) * fps * 2.0).round() as usize)
+            .clamp(2_000_000, 20_000_000);
+        let source_bit_rate = decoder.bit_rate();
+        encoder.set_bit_rate(source_bit_rate.max(fallback_bit_rate));
 
         let mut output = output(dst.to_str().unwrap_or("video.mkv"))
             .map_err(|e| io::Error::other(format!("Failed to create output context: {e}")))?;
         let output_stream_index = {
             let mut output_stream = output
-                .add_stream(ffmpeg_next::codec::encoder::find(CodecId::None))
+                .add_stream(encoder_codec)
                 .map_err(|e| io::Error::other(format!("Failed to add output stream: {e}")))?;
-            output_stream.set_parameters(input_stream.parameters());
-            unsafe {
-                (*output_stream.parameters().as_mut_ptr()).codec_tag = 0;
-            }
+            output_stream.set_time_base(frame_time_base);
+            output_stream.set_rate(frame_rate);
+            output_stream.set_avg_frame_rate(frame_rate);
+            output_stream.set_parameters(&encoder);
             output_stream.index()
         };
         output.set_metadata(input.metadata().to_owned());
+        let mut encoder = encoder
+            .open_as(encoder_codec)
+            .map_err(|e| io::Error::other(format!("Failed to open video encoder: {e}")))?;
+        if let Some(mut output_stream) = output.stream_mut(output_stream_index) {
+            output_stream.set_time_base(frame_time_base);
+            output_stream.set_rate(frame_rate);
+            output_stream.set_avg_frame_rate(frame_rate);
+            output_stream.set_parameters(&encoder);
+            unsafe {
+                (*output_stream.parameters().as_mut_ptr()).codec_tag = 0;
+            }
+        }
 
         output
             .write_header()
             .map_err(|e| io::Error::other(format!("Failed to write video header: {e}")))?;
 
-        let mut next_packet_ts = 0_i64;
-        for (packet_stream, mut packet) in input.packets() {
+        let output_stream_time_base = output
+            .stream(output_stream_index)
+            .map(|stream| stream.time_base())
+            .unwrap_or(frame_time_base);
+        let mut decoded = Video::empty();
+        let mut encoded_pts = 0_i64;
+        for (packet_stream, packet) in input.packets() {
             if packet_stream.index() != input_index {
                 continue;
             }
-            let packet_duration = if packet.duration() > 0 {
-                packet.duration()
-            } else {
-                estimated_packet_duration
-            };
-            let pts = packet.pts().unwrap_or(next_packet_ts);
-            let dts = packet.dts().unwrap_or(pts);
-            packet.set_pts(Some(pts));
-            packet.set_dts(Some(dts));
-            packet.set_duration(packet_duration);
-            packet.set_position(-1);
-            packet.set_stream(output_stream_index);
-            let output_stream_time_base = output
-                .stream(output_stream_index)
-                .map(|stream| stream.time_base())
-                .unwrap_or(input_time_base);
-            packet.rescale_ts(input_time_base, output_stream_time_base);
-            packet
-                .write_interleaved(&mut output)
-                .map_err(|e| io::Error::other(format!("Failed to write video packet: {e}")))?;
-            next_packet_ts = pts.saturating_add(packet_duration);
+            decoder
+                .send_packet(&packet)
+                .map_err(|e| io::Error::other(format!("Failed to send video packet: {e}")))?;
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                let mut encoded_frame = Video::new(output_pixel_format, width, height);
+                scaler
+                    .run(&decoded, &mut encoded_frame)
+                    .map_err(|e| io::Error::other(format!("Failed to convert video frame: {e}")))?;
+                encoded_frame.set_pts(Some(encoded_pts));
+                encoded_pts = encoded_pts.saturating_add(1);
+                encoder
+                    .send_frame(&encoded_frame)
+                    .map_err(|e| io::Error::other(format!("Failed to send encoded frame: {e}")))?;
+
+                let mut encoded_packet = ffmpeg_next::packet::Packet::empty();
+                while encoder.receive_packet(&mut encoded_packet).is_ok() {
+                    encoded_packet.set_stream(output_stream_index);
+                    encoded_packet.rescale_ts(frame_time_base, output_stream_time_base);
+                    encoded_packet.write_interleaved(&mut output).map_err(|e| {
+                        io::Error::other(format!("Failed to write encoded video packet: {e}"))
+                    })?;
+                }
+            }
+        }
+
+        decoder
+            .send_eof()
+            .map_err(|e| io::Error::other(format!("Failed to flush video decoder: {e}")))?;
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            let mut encoded_frame = Video::new(output_pixel_format, width, height);
+            scaler
+                .run(&decoded, &mut encoded_frame)
+                .map_err(|e| io::Error::other(format!("Failed to convert video frame: {e}")))?;
+            encoded_frame.set_pts(Some(encoded_pts));
+            encoded_pts = encoded_pts.saturating_add(1);
+            encoder
+                .send_frame(&encoded_frame)
+                .map_err(|e| io::Error::other(format!("Failed to send encoded frame: {e}")))?;
+
+            let mut encoded_packet = ffmpeg_next::packet::Packet::empty();
+            while encoder.receive_packet(&mut encoded_packet).is_ok() {
+                encoded_packet.set_stream(output_stream_index);
+                encoded_packet.rescale_ts(frame_time_base, output_stream_time_base);
+                encoded_packet.write_interleaved(&mut output).map_err(|e| {
+                    io::Error::other(format!("Failed to write encoded video packet: {e}"))
+                })?;
+            }
+        }
+
+        encoder
+            .send_eof()
+            .map_err(|e| io::Error::other(format!("Failed to flush video encoder: {e}")))?;
+        let mut encoded_packet = ffmpeg_next::packet::Packet::empty();
+        while encoder.receive_packet(&mut encoded_packet).is_ok() {
+            encoded_packet.set_stream(output_stream_index);
+            encoded_packet.rescale_ts(frame_time_base, output_stream_time_base);
+            encoded_packet.write_interleaved(&mut output).map_err(|e| {
+                io::Error::other(format!("Failed to write encoded video packet: {e}"))
+            })?;
         }
 
         output

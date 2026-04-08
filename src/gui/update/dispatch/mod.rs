@@ -47,10 +47,10 @@ impl Maolan {
         &mut self,
         force: bool,
     ) -> Option<Task<Message>> {
-        let (view_is_video, track_name) = {
+        let (view_is_video, track_name, needs_preview_frame, needs_current_frame) = {
             let state = self.state.blocking_read();
             let selected_name = state.selected.iter().next().cloned();
-            let track_name = if selected_name.is_some() {
+            let track = if selected_name.is_some() {
                 selected_name.as_ref().and_then(|name| {
                     state
                         .tracks
@@ -59,9 +59,20 @@ impl Maolan {
                 })
             } else {
                 state.tracks.iter().find(|track| track.video.is_some())
-            }
-            .map(|track| track.name.clone());
-            (matches!(state.view, View::Video), track_name)
+            };
+            let track_name = track.map(|track| track.name.clone());
+            let needs_preview_frame = track
+                .and_then(|track| track.video.as_ref())
+                .is_some_and(|video| video.frame.is_none());
+            let needs_current_frame = track
+                .and_then(|track| track.video.as_ref())
+                .is_some_and(|video| video.current_frame.is_none());
+            (
+                matches!(state.view, View::Video),
+                track_name,
+                needs_preview_frame,
+                needs_current_frame,
+            )
         };
         if !view_is_video {
             return None;
@@ -85,7 +96,20 @@ impl Maolan {
         }
 
         self.last_video_preview_request = Some((track_name.clone(), sample, now));
-        Some(self.send(Action::RequestTrackVideoCurrentFrame { track_name, sample }))
+        let mut tasks = Vec::new();
+        if force || needs_preview_frame {
+            tasks.push(self.send(Action::RequestTrackVideoFrame {
+                track_name: track_name.clone(),
+            }));
+        }
+        if force || needs_current_frame {
+            tasks.push(self.send(Action::RequestTrackVideoCurrentFrame { track_name, sample }));
+        }
+        if tasks.is_empty() {
+            None
+        } else {
+            Some(Task::batch(tasks))
+        }
     }
 
     fn nearest_clip_edge_sample(

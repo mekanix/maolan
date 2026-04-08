@@ -97,16 +97,16 @@ pub fn decode_iframe_preview_strip(
         }
     }
 
-    if keyframes.is_empty() {
-        if let Some(frame) = fallback {
-            keyframes.push(frame);
-        }
+    if keyframes.is_empty()
+        && let Some(frame) = fallback
+    {
+        keyframes.push(frame);
     }
     if keyframes.is_empty() {
         return Err("no decoded video frame available".to_string());
     }
 
-    let desired = keyframes.len().min(PREVIEW_MAX_THUMBS).max(1);
+    let desired = keyframes.len().clamp(1, PREVIEW_MAX_THUMBS);
     let mut selected = Vec::with_capacity(desired);
     for index in 0..desired {
         let src_index = index * keyframes.len() / desired;

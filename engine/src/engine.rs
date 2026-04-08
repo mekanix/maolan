@@ -49,7 +49,7 @@ use crate::{
     history::{History, UndoEntry, create_inverse_actions, should_record},
     hw::{config, traits::HwDevice},
     kind::Kind,
-    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData},
+    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, VideoClipData},
     midi::clip::MIDIClip,
     midi::io::MidiEvent,
     mutex::UnsafeMutex,
@@ -250,6 +250,29 @@ impl Engine {
     const MIDI_CC_ALL_NOTES_OFF: u8 = 123;
     const MIDI_CC_SUSTAIN_PEDAL: u8 = 64;
 
+    fn resolve_video_clip_data(&self, clip: &VideoClipData) -> VideoClipData {
+        let clip_path = std::path::Path::new(&clip.path);
+        if clip_path.is_absolute() {
+            return clip.clone();
+        }
+
+        let resolved = self
+            .session_dir
+            .as_ref()
+            .map(|base| base.join(clip_path))
+            .filter(|candidate| candidate.exists())
+            .or_else(|| {
+                let cwd_candidate = clip_path.to_path_buf();
+                cwd_candidate.exists().then_some(cwd_candidate)
+            })
+            .or_else(|| self.session_dir.as_ref().map(|base| base.join(clip_path)))
+            .unwrap_or_else(|| clip_path.to_path_buf());
+
+        let mut resolved_clip = clip.clone();
+        resolved_clip.path = resolved.to_string_lossy().into_owned();
+        resolved_clip
+    }
+
     fn request_track_video_frame(&self, track_name: &str) {
         let Some(track_handle) = self.state.lock().tracks.get(track_name).cloned() else {
             return;
@@ -261,6 +284,7 @@ impl Engine {
             };
             (clip, track.sample_rate)
         };
+        let clip = self.resolve_video_clip_data(&clip);
 
         let tx = self.tx.clone();
         let track_name = track_name.to_string();
@@ -293,6 +317,7 @@ impl Engine {
             };
             (clip, track.sample_rate)
         };
+        let clip = self.resolve_video_clip_data(&clip);
 
         let tx = self.tx.clone();
         let track_name = track_name.to_string();
@@ -3882,7 +3907,7 @@ impl Engine {
                     None
                 };
 
-                let maybe_track_timing = maybe_hw.or_else(|| {
+                let maybe_track_timing = maybe_hw.or({
                     if has_video
                         && audio_ins == 0
                         && audio_outs == 0
@@ -4171,6 +4196,9 @@ impl Engine {
                 if let Some(track) = self.state.lock().tracks.get(track_name) {
                     track.lock().video_current_frame = Some(buffer.clone());
                 }
+            }
+            Action::RequestTrackVideoFrame { ref track_name } => {
+                self.request_track_video_frame(track_name);
             }
             Action::RequestTrackVideoCurrentFrame {
                 ref track_name,
