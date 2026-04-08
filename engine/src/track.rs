@@ -489,6 +489,7 @@ pub struct Track {
     pub record_tap_midi_in: Vec<MidiEvent>,
     pub video_clip: Option<VideoClipData>,
     pub video_frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
+    pub video_current_frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
     #[cfg(all(unix, not(target_os = "macos")))]
     pub lv2_state_base_dir: Option<PathBuf>,
     pub session_base_dir: Option<PathBuf>,
@@ -572,6 +573,7 @@ impl Track {
             record_tap_midi_in: vec![],
             video_clip: None,
             video_frame: None,
+            video_current_frame: None,
             #[cfg(all(unix, not(target_os = "macos")))]
             lv2_state_base_dir: None,
             session_base_dir: None,

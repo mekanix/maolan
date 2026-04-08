@@ -168,6 +168,7 @@ impl Maolan {
                         length: clip.length,
                         offset: clip.offset,
                         frame: None,
+                        current_frame: None,
                     });
                     track.height = track.height.max(track.min_height_for_layout().max(60.0));
                 }
@@ -187,6 +188,29 @@ impl Maolan {
                         length: clip.length,
                         offset: clip.offset,
                         frame: Some(buffer.clone()),
+                        current_frame: track
+                            .video
+                            .as_ref()
+                            .and_then(|video| video.current_frame.clone()),
+                    });
+                }
+                true
+            }
+            Action::TrackVideoCurrentFrame {
+                track_name,
+                buffer,
+                clip,
+            } => {
+                let mut state = self.state.blocking_write();
+                if let Some(track) = state.tracks.iter_mut().find(|t| t.name == *track_name) {
+                    track.has_video = true;
+                    track.video = Some(crate::state::VideoClip {
+                        path: clip.path.clone(),
+                        start: clip.start,
+                        length: clip.length,
+                        offset: clip.offset,
+                        frame: track.video.as_ref().and_then(|video| video.frame.clone()),
+                        current_frame: Some(buffer.clone()),
                     });
                 }
                 true

@@ -60,6 +60,8 @@ pub struct VideoClip {
     pub offset: usize,
     #[serde(skip, default)]
     pub frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
+    #[serde(skip, default)]
+    pub current_frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

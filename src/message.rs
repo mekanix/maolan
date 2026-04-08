@@ -724,6 +724,8 @@ pub enum Message {
     },
     TracksResizeStart,
     MixerResizeStart,
+    VideoPreviewResizeStart,
+    VideoPreviewSplitResizeStart,
     MixerLevelEditStart(String),
     MixerLevelEditInput(String),
     MixerLevelEditCommit,
@@ -787,6 +789,8 @@ pub enum Message {
     PianoSysExScrollYChanged(f32),
     TracksResizeHover(bool),
     MixerResizeHover(bool),
+    VideoPreviewResizeHover(bool),
+    VideoPreviewSplitResizeHover(bool),
 
     OpenFileImporter,
     DeleteUnusedSessionMediaFiles,
@@ -870,6 +874,7 @@ pub enum Message {
     SendMessageFinished(Result<(), String>),
 
     Workspace,
+    Video,
     Connections,
     ToggleMixerVisibility,
     ToggleTracksVisibility,

@@ -2045,6 +2045,12 @@ impl Maolan {
             Message::MixerResizeHover(hovered) => {
                 self.mixer_resize_hovered = hovered;
             }
+            Message::VideoPreviewResizeHover(hovered) => {
+                self.video_preview_resize_hovered = hovered;
+            }
+            Message::VideoPreviewSplitResizeHover(hovered) => {
+                self.video_preview_split_resize_hovered = hovered;
+            }
             Message::TransportRecordToggle => {
                 self.toolbar.update(&message);
                 if self.record_armed {
@@ -2087,6 +2093,24 @@ impl Maolan {
                 let handled_response_state = self.handle_response_engine_state_action(a);
                 let handled_response_track = self.handle_response_track_action(a);
                 let handled_response_timing = self.handle_response_timing_state_action(a);
+                if matches!(a, Action::TransportPosition(_))
+                    && matches!(self.state.blocking_read().view, View::Video)
+                {
+                    let sample = self.transport_samples.max(0.0) as usize;
+                    let track_name = {
+                        let state = self.state.blocking_read();
+                        let selected_name = state.selected.iter().next().cloned();
+                        selected_name
+                            .as_ref()
+                            .and_then(|name| state.tracks.iter().find(|track| &track.name == name))
+                            .or_else(|| state.tracks.iter().find(|track| track.video.is_some()))
+                            .map(|track| track.name.clone())
+                    };
+                    if let Some(track_name) = track_name {
+                        return self
+                            .send(Action::RequestTrackVideoCurrentFrame { track_name, sample });
+                    }
+                }
                 if handled_response_track {
                     match a {
                         Action::TrackAddAudioInput(track_name)
@@ -5184,7 +5208,7 @@ impl Maolan {
                     crate::state::View::Connections => {
                         return self.update(Message::RemoveSelected);
                     }
-                    crate::state::View::Workspace => {
+                    crate::state::View::Workspace | crate::state::View::Video => {
                         return self.update(Message::RemoveSelectedTracks);
                     }
                     crate::state::View::TrackPlugins => {
@@ -5379,6 +5403,26 @@ impl Maolan {
                 };
                 self.state.blocking_write().resizing =
                     Some(Resizing::Mixer(initial_height, initial_mouse_y));
+            }
+            Message::VideoPreviewResizeStart => {
+                let (initial_height, initial_mouse_y) = {
+                    let state = self.state.blocking_read();
+                    let height = match state.video_preview_height {
+                        Length::Fixed(v) => v,
+                        _ => 280.0,
+                    };
+                    (height, state.cursor.y)
+                };
+                self.state.blocking_write().resizing =
+                    Some(Resizing::VideoPreview(initial_height, initial_mouse_y));
+            }
+            Message::VideoPreviewSplitResizeStart => {
+                let (initial_split, initial_mouse_x) = {
+                    let state = self.state.blocking_read();
+                    (state.video_preview_split, state.cursor.x)
+                };
+                self.state.blocking_write().resizing =
+                    Some(Resizing::VideoPreviewSplit(initial_split, initial_mouse_x));
             }
             Message::MixerLevelEditStart(ref track_name) => {
                 let level = {
@@ -5780,6 +5824,16 @@ impl Maolan {
                         let delta = position.y - initial_mouse_y;
                         self.state.blocking_write().mixer_height =
                             Length::Fixed((initial_height - delta).max(60.0));
+                    }
+                    Some(Resizing::VideoPreview(initial_height, initial_mouse_y)) => {
+                        let delta = position.y - initial_mouse_y;
+                        self.state.blocking_write().video_preview_height =
+                            Length::Fixed((initial_height + delta).clamp(120.0, 720.0));
+                    }
+                    Some(Resizing::VideoPreviewSplit(initial_split, initial_mouse_x)) => {
+                        let delta = (position.x - initial_mouse_x) / self.size.width.max(1.0);
+                        self.state.blocking_write().video_preview_split =
+                            (initial_split + delta).clamp(0.2, 0.8);
                     }
                     Some(Resizing::Fade {
                         kind,
@@ -8128,6 +8182,32 @@ impl Maolan {
                 state.pitch_correction_selecting_rect = None;
                 drop(state);
                 return self.queue_midi_clip_preview_loads();
+            }
+            Message::Video => {
+                let mut state = self.state.blocking_write();
+                state.view = if matches!(state.view, View::Video) {
+                    View::Workspace
+                } else {
+                    View::Video
+                };
+                let should_request = matches!(state.view, View::Video);
+                drop(state);
+                if should_request {
+                    let sample = self.transport_samples.max(0.0) as usize;
+                    let track_name = {
+                        let state = self.state.blocking_read();
+                        let selected_name = state.selected.iter().next().cloned();
+                        selected_name
+                            .as_ref()
+                            .and_then(|name| state.tracks.iter().find(|track| &track.name == name))
+                            .or_else(|| state.tracks.iter().find(|track| track.video.is_some()))
+                            .map(|track| track.name.clone())
+                    };
+                    if let Some(track_name) = track_name {
+                        return self
+                            .send(Action::RequestTrackVideoCurrentFrame { track_name, sample });
+                    }
+                }
             }
             Message::ToggleMixerVisibility => {
                 self.mixer_visible = !self.mixer_visible;

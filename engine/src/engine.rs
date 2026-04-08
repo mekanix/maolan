@@ -282,6 +282,38 @@ impl Engine {
         });
     }
 
+    fn request_track_video_current_frame(&self, track_name: &str, sample: usize) {
+        let Some(track_handle) = self.state.lock().tracks.get(track_name).cloned() else {
+            return;
+        };
+        let (clip, sample_rate) = {
+            let track = track_handle.lock();
+            let Some(clip) = track.video_clip.clone() else {
+                return;
+            };
+            (clip, track.sample_rate)
+        };
+
+        let tx = self.tx.clone();
+        let track_name = track_name.to_string();
+        tokio::spawn(async move {
+            match video::decode_frame_at_sample(&clip, sample_rate, sample) {
+                Ok(buffer) => {
+                    let _ = tx
+                        .send(Message::Response(Ok(Action::TrackVideoCurrentFrame {
+                            track_name,
+                            buffer,
+                            clip,
+                        })))
+                        .await;
+                }
+                Err(err) => {
+                    let _ = tx.send(Message::Response(Err(err))).await;
+                }
+            }
+        });
+    }
+
     fn default_clip_plugin_graph_json(audio_ins: usize, audio_outs: usize) -> serde_json::Value {
         let connections = (0..audio_ins.min(audio_outs))
             .map(|port| {
@@ -4131,6 +4163,21 @@ impl Engine {
                     track.lock().video_frame = Some(buffer.clone());
                 }
             }
+            Action::TrackVideoCurrentFrame {
+                ref track_name,
+                ref buffer,
+                ..
+            } => {
+                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    track.lock().video_current_frame = Some(buffer.clone());
+                }
+            }
+            Action::RequestTrackVideoCurrentFrame {
+                ref track_name,
+                sample,
+            } => {
+                self.request_track_video_current_frame(track_name, sample);
+            }
             Action::TrackToggleArm(ref name) => {
                 if self.reject_if_track_frozen(name, "arming/disarming").await {
                     return;
@@ -5538,8 +5585,10 @@ impl Engine {
                 track.video_clip = clip.clone();
                 track.has_video = track.has_video || clip.is_some();
                 track.video_frame = None;
+                track.video_current_frame = None;
                 if clip.is_some() {
                     self.request_track_video_frame(track_name);
+                    self.request_track_video_current_frame(track_name, self.transport_sample);
                 }
             }
             Action::RemoveClip {

@@ -135,3 +135,82 @@ pub fn decode_iframe_preview_strip(
         pts_samples: clip.start,
     })))
 }
+
+pub fn decode_frame_at_sample(
+    clip: &VideoClipData,
+    sample_rate: f64,
+    target_sample: usize,
+) -> Result<Arc<UnsafeMutex<VideoFrameBuffer>>, String> {
+    ffmpeg_init().map_err(|e| format!("ffmpeg init failed: {e}"))?;
+
+    let mut input = format::input(&clip.path).map_err(|e| format!("open video failed: {e}"))?;
+    let Some(stream) = input.streams().best(media::Type::Video) else {
+        return Err("no video stream found".to_string());
+    };
+    let stream_index = stream.index();
+    let time_base = stream.time_base();
+    let context = codec::Context::from_parameters(stream.parameters())
+        .map_err(|e| format!("video codec params failed: {e}"))?;
+    let mut decoder = context
+        .decoder()
+        .video()
+        .map_err(|e| format!("video decoder open failed: {e}"))?;
+
+    let width = decoder.width().max(1);
+    let height = decoder.height().max(1);
+    let mut scaler = ScalingContext::get(
+        decoder.format(),
+        width,
+        height,
+        Pixel::RGBA,
+        width,
+        height,
+        Flags::BILINEAR,
+    )
+    .map_err(|e| format!("video scaler init failed: {e}"))?;
+
+    let clip_local_sample = target_sample
+        .saturating_sub(clip.start)
+        .saturating_add(clip.offset)
+        .min(clip.offset.saturating_add(clip.length));
+    let target_seconds = clip_local_sample as f64 / sample_rate.max(1.0);
+
+    let mut decoded = frame::Video::empty();
+    let mut rgba = frame::Video::empty();
+    let mut fallback = None::<VideoFrameBuffer>;
+
+    for (packet_stream, packet) in input.packets() {
+        if packet_stream.index() != stream_index {
+            continue;
+        }
+        decoder
+            .send_packet(&packet)
+            .map_err(|e| format!("send video packet failed: {e}"))?;
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            scaler
+                .run(&decoded, &mut rgba)
+                .map_err(|e| format!("convert video frame failed: {e}"))?;
+
+            let pts = decoded.timestamp().unwrap_or_default();
+            let frame_seconds = (pts as f64) * f64::from(time_base);
+            let pts_samples = (frame_seconds * sample_rate.max(1.0)).max(0.0) as usize;
+            let frame_buffer = VideoFrameBuffer {
+                width,
+                height,
+                rgba: rgba_pixels(&rgba, width, height),
+                pts_samples,
+            };
+
+            if fallback.is_none() {
+                fallback = Some(frame_buffer.clone());
+            }
+            if frame_seconds >= target_seconds {
+                return Ok(Arc::new(UnsafeMutex::new(frame_buffer)));
+            }
+        }
+    }
+
+    fallback
+        .map(|frame| Arc::new(UnsafeMutex::new(frame)))
+        .ok_or_else(|| "no decoded video frame available".to_string())
+}

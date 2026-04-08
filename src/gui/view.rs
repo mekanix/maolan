@@ -7,10 +7,10 @@ use crate::{
     workspace::WorkspaceViewArgs,
 };
 use iced::{
-    Border, Color, Length,
+    Background, Border, Color, Length,
     widget::{
-        Stack, button, column, container, progress_bar, row, scrollable, text, text_editor,
-        text_input,
+        Stack, button, column, container, mouse_area, progress_bar, row, scrollable, text,
+        text_editor, text_input,
     },
 };
 
@@ -259,6 +259,92 @@ impl Maolan {
                             mixer_level_edit_track: self.mixer_level_edit_track.as_deref(),
                             mixer_level_edit_input: &self.mixer_level_edit_input,
                         }),
+                        View::Video => {
+                            let video_preview_height = {
+                                let state = self.state.blocking_read();
+                                match state.video_preview_height {
+                                    Length::Fixed(v) => v,
+                                    _ => 280.0,
+                                }
+                            };
+                            column![
+                                container(
+                                    self.workspace
+                                        .video_view(self.video_preview_split_resize_hovered),
+                                )
+                                .height(Length::Fixed(video_preview_height)),
+                                mouse_area(
+                                    container("")
+                                        .width(Length::Fill)
+                                        .height(Length::Fixed(3.0))
+                                        .style(move |_theme| container::Style {
+                                            background: Some(Background::Color(Color {
+                                                r: 0.7,
+                                                g: 0.7,
+                                                b: 0.7,
+                                                a: if self.video_preview_resize_hovered {
+                                                    0.95
+                                                } else {
+                                                    0.6
+                                                },
+                                            })),
+                                            ..container::Style::default()
+                                        }),
+                                )
+                                .on_enter(Message::VideoPreviewResizeHover(true))
+                                .on_exit(Message::VideoPreviewResizeHover(false))
+                                .on_press(Message::VideoPreviewResizeStart),
+                                self.workspace.view(WorkspaceViewArgs {
+                                    session_root: self.session_dir.as_ref(),
+                                    playhead_samples: Some(self.transport_samples),
+                                    transport_active: self.playing,
+                                    pixels_per_sample: self.pixels_per_sample(),
+                                    beat_pixels: self.beat_pixels(),
+                                    samples_per_bar: self.samples_per_bar() as f32,
+                                    loop_range_samples: self.loop_range_samples,
+                                    punch_range_samples: self.punch_range_samples,
+                                    snap_mode: self.snap_mode,
+                                    samples_per_beat: self.samples_per_beat(),
+                                    zoom_visible_bars: self.zoom_visible_bars,
+                                    editor_scroll_x: self.editor_scroll_x,
+                                    mixer_scroll_x: self.mixer_scroll_x,
+                                    window_width: self.size.width,
+                                    window_height: self.size.height,
+                                    editor_scroll_y: self.editor_scroll_y,
+                                    track_drag_active: self.track.is_some(),
+                                    tracks_resize_hovered: self.tracks_resize_hovered,
+                                    mixer_resize_hovered: self.mixer_resize_hovered,
+                                    tracks_visible: self.tracks_visible,
+                                    editor_visible: self.editor_visible,
+                                    mixer_visible: self.mixer_visible,
+                                    active_clip_drag: self.clip.as_ref(),
+                                    active_clip_target_track: self
+                                        .clip_preview_target_track
+                                        .as_deref(),
+                                    active_clip_target_valid: self.clip_preview_target_valid,
+                                    active_clip_snap_adjust_samples: self
+                                        .clip_preview_snap_adjust_samples,
+                                    active_clip_snap_targets: &self.clip_snap_targets,
+                                    recording_preview_bounds: self.recording_preview_bounds(),
+                                    recording_preview_peaks: Some(&self.recording_preview_peaks),
+                                    midi_clip_previews: Some(&self.midi_clip_previews),
+                                    shift_pressed,
+                                    selected_tempo_points: self
+                                        .selected_tempo_points
+                                        .iter()
+                                        .copied()
+                                        .collect(),
+                                    selected_time_signature_points: self
+                                        .selected_time_signature_points
+                                        .iter()
+                                        .copied()
+                                        .collect(),
+                                    mixer_level_edit_track: self.mixer_level_edit_track.as_deref(),
+                                    mixer_level_edit_input: &self.mixer_level_edit_input,
+                                })
+                            ]
+                            .into()
+                        }
                         View::Connections => self.connections.view(),
                         View::HwInputPorts => self.hw.jack_ports_view(true),
                         View::HwOutputPorts => self.hw.jack_ports_view(false),
@@ -364,7 +450,8 @@ impl Maolan {
                         self.tracks_visible,
                         self.editor_visible,
                         self.mixer_visible,
-                        self.show_log_window
+                        self.show_log_window,
+                        &view_kind,
                     ),];
                     content = content.push(self.toolbar.view(ToolbarViewState {
                         playing: self.playing,

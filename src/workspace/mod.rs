@@ -3,6 +3,7 @@ mod mixer;
 mod ruler;
 mod tempo;
 mod tracks;
+mod video;
 
 use crate::{
     consts::{
@@ -132,6 +133,7 @@ pub struct Workspace {
     ruler: ruler::Ruler,
     tempo: tempo::Tempo,
     tracks: tracks::Tracks,
+    video: video::Video,
 }
 
 pub struct WorkspaceViewArgs<'a> {
@@ -183,6 +185,7 @@ impl Workspace {
             ruler: ruler::Ruler::new(),
             tempo: tempo::Tempo::new(),
             tracks: tracks::Tracks::new(state.clone()),
+            video: video::Video::new(state.clone()),
         }
     }
 
@@ -898,6 +901,10 @@ impl Workspace {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    pub fn video_view(&self, split_resize_hovered: bool) -> Element<'_, Message> {
+        self.video.view(split_resize_hovered)
     }
 
     pub fn pitch_correction_view<'a>(
