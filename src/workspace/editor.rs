@@ -9,11 +9,12 @@ use crate::{
     state::{ClipPeaks, MidiClipPreviewMap, State, StateData, Track},
 };
 use iced::{
-    Background, Border, Color, Element, Length, Point, Rectangle, Renderer, Theme, mouse,
+    Background, Border, Color, ContentFit, Element, Length, Point, Rectangle, Renderer, Theme,
+    mouse,
     widget::{
         Space, Stack, canvas,
         canvas::{Frame, Geometry, Path},
-        column, container, mouse_area, pin, text,
+        column, container, image, mouse_area, pin, text,
     },
 };
 use maolan_engine::kind::Kind;
@@ -192,6 +193,7 @@ struct TrackLaneBackgroundCanvas {
     header_height: f32,
     lane_height: f32,
     audio_lanes: usize,
+    video_lanes: usize,
     midi_lanes: usize,
 }
 
@@ -209,6 +211,7 @@ impl TrackLaneBackgroundCanvas {
         self.header_height.to_bits().hash(&mut hasher);
         self.lane_height.to_bits().hash(&mut hasher);
         self.audio_lanes.hash(&mut hasher);
+        self.video_lanes.hash(&mut hasher);
         self.midi_lanes.hash(&mut hasher);
         hasher.finish()
     }
@@ -258,6 +261,18 @@ impl canvas::Program<Message> for TrackLaneBackgroundCanvas {
                 }
 
                 for lane in 0..self.midi_lanes {
+                    let y = self.header_height
+                        + (self.audio_lanes + self.video_lanes + lane) as f32 * self.lane_height;
+                    frame.fill(
+                        &Path::rectangle(
+                            Point::new(0.0, y),
+                            iced::Size::new(bounds.width, self.lane_height),
+                        ),
+                        Color::from_rgba(0.12, 0.26, 0.14, 0.25),
+                    );
+                }
+
+                for lane in 0..self.video_lanes {
                     let y =
                         self.header_height + (self.audio_lanes + lane) as f32 * self.lane_height;
                     frame.fill(
@@ -265,7 +280,7 @@ impl canvas::Program<Message> for TrackLaneBackgroundCanvas {
                             Point::new(0.0, y),
                             iced::Size::new(bounds.width, self.lane_height),
                         ),
-                        Color::from_rgba(0.12, 0.26, 0.14, 0.25),
+                        Color::from_rgba(0.30, 0.24, 0.08, 0.25),
                     );
                 }
             });
@@ -279,12 +294,14 @@ fn track_lane_background_overlay(
     header_height: f32,
     lane_height: f32,
     audio_lanes: usize,
+    video_lanes: usize,
     midi_lanes: usize,
 ) -> Element<'static, Message> {
     canvas(TrackLaneBackgroundCanvas {
         header_height,
         lane_height,
         audio_lanes,
+        video_lanes,
         midi_lanes,
     })
     .width(Length::Fill)
@@ -365,6 +382,7 @@ fn view_track_elements(args: TrackElementViewArgs<'_>) -> Element<'static, Messa
             layout.header_height,
             lane_height,
             track.audio.ins,
+            track.video_lane_count(),
             track.midi.ins,
         ))
         .position(Point::new(0.0, 0.0))
@@ -780,6 +798,71 @@ fn view_track_elements(args: TrackElementViewArgs<'_>) -> Element<'static, Messa
                     .into(),
             );
         }
+    }
+    if let Some(video) = &track.video {
+        let lane_top = track.video_lane_top() + 4.0;
+        let clip_width = (video.length as f32 * pixels_per_sample).max(24.0);
+        let clip_height = (lane_clip_height - 2.0).max(8.0);
+        let label = std::path::Path::new(&video.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(video.path.as_str())
+            .to_string();
+        let frame_element: Element<'static, Message> = if let Some(frame) = &video.frame {
+            let frame = frame.lock();
+            if frame.width > 0 && frame.height > 0 && !frame.rgba.is_empty() {
+                image(image::Handle::from_rgba(
+                    frame.width,
+                    frame.height,
+                    frame.rgba.clone(),
+                ))
+                .width(Length::Fixed(clip_width))
+                .height(Length::Fixed(clip_height))
+                .content_fit(ContentFit::Fill)
+                .into()
+            } else {
+                container(text(label.clone()).size(11))
+                    .center_y(Length::Fill)
+                    .padding([2, 6])
+                    .width(Length::Fixed(clip_width))
+                    .height(Length::Fixed(clip_height))
+                    .style(|_theme| container::Style {
+                        background: Some(Background::Color(Color::from_rgba(
+                            0.64, 0.52, 0.12, 0.82,
+                        ))),
+                        border: Border {
+                            color: Color::from_rgba(0.98, 0.90, 0.44, 0.9),
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        text_color: Some(Color::from_rgb(0.14, 0.11, 0.03)),
+                        ..container::Style::default()
+                    })
+                    .into()
+            }
+        } else {
+            container(text(label.clone()).size(11))
+                .center_y(Length::Fill)
+                .padding([2, 6])
+                .width(Length::Fixed(clip_width))
+                .height(Length::Fixed(clip_height))
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color::from_rgba(0.64, 0.52, 0.12, 0.82))),
+                    border: Border {
+                        color: Color::from_rgba(0.98, 0.90, 0.44, 0.9),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    text_color: Some(Color::from_rgb(0.14, 0.11, 0.03)),
+                    ..container::Style::default()
+                })
+                .into()
+        };
+        clips.push(
+            pin(frame_element)
+                .position(Point::new(video.start as f32 * pixels_per_sample, lane_top))
+                .into(),
+        );
     }
     for (index, clip) in track.midi.clips.iter().enumerate() {
         let clip_name = clip.name.clone();

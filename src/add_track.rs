@@ -1,7 +1,7 @@
 use crate::message::{AddTrack, Message};
 use iced::{
     Alignment, Border, Color, Element, Length,
-    widget::{Id, button, column, container, pick_list, row, text, text_input},
+    widget::{Id, button, checkbox, column, container, pick_list, row, text, text_input},
 };
 use maolan_engine::message::Action;
 use maolan_widgets::numeric_input::number_input;
@@ -14,6 +14,7 @@ pub struct AddTrackView {
     audio_outs: usize,
     midi_ins: usize,
     midi_outs: usize,
+    has_video: bool,
     available_templates: Vec<String>,
     selected_template: Option<String>,
 }
@@ -56,6 +57,7 @@ impl AddTrackView {
                         midi_ins: self.midi_ins,
                         audio_outs: self.audio_outs,
                         midi_outs: self.midi_outs,
+                        has_video: self.has_video,
                     })
                 } else {
                     Message::AddTrackFromTemplate {
@@ -113,6 +115,9 @@ impl AddTrackView {
                 AddTrack::AudioIns(ins) => {
                     self.audio_ins = *ins;
                 }
+                AddTrack::VideoSubtrack(has_video) => {
+                    self.has_video = *has_video;
+                }
                 AddTrack::MIDIIns(ins) => {
                     self.midi_ins = *ins;
                 }
@@ -130,6 +135,7 @@ impl AddTrackView {
                         self.audio_outs = 1;
                         self.midi_ins = 0;
                         self.midi_outs = 0;
+                        self.has_video = false;
                     } else {
                         self.selected_template = Some(template.clone());
                         // Load template to get ins/outs
@@ -140,6 +146,7 @@ impl AddTrackView {
                             self.audio_outs = audio_outs;
                             self.midi_ins = midi_ins;
                             self.midi_outs = midi_outs;
+                            self.has_video = false;
                         }
                     }
                 }
@@ -230,6 +237,15 @@ impl AddTrackView {
                 ]
                 .spacing(10),
             );
+            col = col.push(
+                row![
+                    text("Video subtrack:"),
+                    checkbox(self.has_video)
+                        .on_toggle(|enabled| Message::AddTrack(AddTrack::VideoSubtrack(enabled))),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            );
         } else {
             // Show read-only information when a template is selected
             col = col.push(
@@ -275,6 +291,7 @@ impl Default for AddTrackView {
             audio_outs: 1,
             midi_ins: 0,
             midi_outs: 0,
+            has_video: false,
             name: "".to_string(),
             available_templates: vec![],
             selected_template: Some("empty".to_string()),
@@ -303,6 +320,7 @@ mod tests {
         view.update(&Message::AddTrack(AddTrack::AudioOuts(4)));
         view.update(&Message::AddTrack(AddTrack::MIDIIns(1)));
         view.update(&Message::AddTrack(AddTrack::MIDIOuts(5)));
+        view.update(&Message::AddTrack(AddTrack::VideoSubtrack(true)));
 
         assert_eq!(view.name, "Lead");
         assert_eq!(view.count, 3);
@@ -310,6 +328,7 @@ mod tests {
         assert_eq!(view.audio_outs, 4);
         assert_eq!(view.midi_ins, 1);
         assert_eq!(view.midi_outs, 5);
+        assert!(view.has_video);
     }
 
     #[test]
@@ -340,6 +359,7 @@ mod tests {
         assert_eq!(view.audio_outs, 1);
         assert_eq!(view.midi_ins, 0);
         assert_eq!(view.midi_outs, 0);
+        assert!(!view.has_video);
     }
 
     #[test]
@@ -384,6 +404,7 @@ mod tests {
         assert_eq!(view.audio_outs, 3);
         assert_eq!(view.midi_ins, 4);
         assert_eq!(view.midi_outs, 5);
+        assert!(!view.has_video);
     }
 
     #[test]
@@ -406,6 +427,7 @@ mod tests {
         assert_eq!(view.audio_outs, 1);
         assert_eq!(view.midi_ins, 0);
         assert_eq!(view.midi_outs, 0);
+        assert!(!view.has_video);
     }
 
     #[test]

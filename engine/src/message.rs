@@ -130,6 +130,22 @@ pub struct MidiClipData {
     pub grouped_clips: Vec<MidiClipData>,
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct VideoClipData {
+    pub path: String,
+    pub start: usize,
+    pub length: usize,
+    pub offset: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VideoFrameBuffer {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub pts_samples: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClipMoveFrom {
     pub track_name: String,
@@ -302,6 +318,7 @@ pub enum Action {
         midi_ins: usize,
         audio_outs: usize,
         midi_outs: usize,
+        has_video: bool,
     },
     TrackAddAudioInput(String),
     TrackAddAudioOutput(String),
@@ -335,6 +352,10 @@ pub enum Action {
         kind: Kind,
         audio_clip: Option<AudioClipData>,
         midi_clip: Option<MidiClipData>,
+    },
+    SetTrackVideoClip {
+        track_name: String,
+        clip: Option<VideoClipData>,
     },
     RemoveClip {
         track_name: String,
@@ -404,6 +425,11 @@ pub enum Action {
     MeterSnapshot {
         hw_out_db: Arc<Vec<f32>>,
         track_meters: Arc<Vec<(String, Vec<f32>)>>,
+    },
+    TrackVideoFrame {
+        track_name: String,
+        buffer: Arc<UnsafeMutex<VideoFrameBuffer>>,
+        clip: VideoClipData,
     },
     TrackToggleArm(String),
     TrackToggleMute(String),

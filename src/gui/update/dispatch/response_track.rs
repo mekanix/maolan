@@ -158,6 +158,39 @@ impl Maolan {
                 }
                 true
             }
+            Action::SetTrackVideoClip { track_name, clip } => {
+                let mut state = self.state.blocking_write();
+                if let Some(track) = state.tracks.iter_mut().find(|t| t.name == *track_name) {
+                    track.has_video = track.has_video || clip.is_some();
+                    track.video = clip.as_ref().map(|clip| crate::state::VideoClip {
+                        path: clip.path.clone(),
+                        start: clip.start,
+                        length: clip.length,
+                        offset: clip.offset,
+                        frame: None,
+                    });
+                    track.height = track.height.max(track.min_height_for_layout().max(60.0));
+                }
+                true
+            }
+            Action::TrackVideoFrame {
+                track_name,
+                buffer,
+                clip,
+            } => {
+                let mut state = self.state.blocking_write();
+                if let Some(track) = state.tracks.iter_mut().find(|t| t.name == *track_name) {
+                    track.has_video = true;
+                    track.video = Some(crate::state::VideoClip {
+                        path: clip.path.clone(),
+                        start: clip.start,
+                        length: clip.length,
+                        offset: clip.offset,
+                        frame: Some(buffer.clone()),
+                    });
+                }
+                true
+            }
             Action::TrackAddAudioOutput(name) => {
                 let mut state = self.state.blocking_write();
                 if let Some(track) = state.tracks.iter_mut().find(|t| t.name == *name) {

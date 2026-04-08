@@ -45,6 +45,7 @@ struct TrackViewData {
     audio_outs: usize,
     primary_audio_ins: usize,
     primary_audio_outs: usize,
+    video_label: Option<String>,
     midi_ins: usize,
     midi_outs: usize,
     midi_lane_channels: Vec<Option<u8>>,
@@ -372,6 +373,7 @@ impl Tracks {
         track.layout.header_height.to_bits().hash(&mut hasher);
         track.layout.lane_height.to_bits().hash(&mut hasher);
         track.layout.audio_lanes.hash(&mut hasher);
+        track.layout.video_lanes.hash(&mut hasher);
         track.layout.midi_lanes.hash(&mut hasher);
         track.selected.hash(&mut hasher);
         track.resize_hovered.hash(&mut hasher);
@@ -385,6 +387,7 @@ impl Tracks {
         track.audio_outs.hash(&mut hasher);
         track.primary_audio_ins.hash(&mut hasher);
         track.primary_audio_outs.hash(&mut hasher);
+        track.video_label.hash(&mut hasher);
         track.midi_ins.hash(&mut hasher);
         track.midi_outs.hash(&mut hasher);
         track.midi_lane_channels.hash(&mut hasher);
@@ -507,7 +510,8 @@ impl Tracks {
         let lane_row_count = track
             .midi_ins
             .saturating_sub(usize::from(inline_midi_lane_selector))
-            + track.visible_automation_lanes.len();
+            + track.visible_automation_lanes.len()
+            + usize::from(track.video_label.is_some());
         let lane_rows_height = if lane_row_count > 0 {
             lane_row_count as f32 * lane_h
                 + lane_row_count.saturating_sub(1) as f32 * TRACK_SUBTRACK_GAP
@@ -662,6 +666,32 @@ impl Tracks {
         };
 
         let mut lane_rows: Column<'static, Message> = column![];
+        if let Some(video_label) = &track.video_label {
+            lane_rows = lane_rows.push(
+                container(
+                    row![
+                        Self::info_badge("VIDEO".to_string(), true),
+                        text(video_label.clone()).size(11),
+                        Space::new().width(Length::Fill),
+                    ]
+                    .align_y(Alignment::Center)
+                    .spacing(6),
+                )
+                .width(Length::Fill)
+                .height(Length::Fixed(lane_h))
+                .padding([4, 6])
+                .style(move |_theme| container::Style {
+                    background: Some(Background::Color(Color::from_rgba(0.30, 0.24, 0.08, 0.90))),
+                    border: Border {
+                        color: Color::from_rgba(0.86, 0.72, 0.28, 0.30),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    text_color: Some(Color::from_rgb(0.98, 0.93, 0.72)),
+                    ..container::Style::default()
+                }),
+            );
+        }
         for lane_index in 0..track.midi_ins {
             if inline_midi_lane_selector && lane_index == 0 {
                 continue;
@@ -925,6 +955,13 @@ impl Tracks {
                             audio_outs: track.audio.outs,
                             primary_audio_ins: track.primary_audio_ins(),
                             primary_audio_outs: track.primary_audio_outs(),
+                            video_label: track.video.as_ref().map(|video| {
+                                let file = std::path::Path::new(&video.path)
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or(video.path.as_str());
+                                file.to_string()
+                            }),
                             midi_ins: track.midi.ins,
                             midi_outs: track.midi.outs,
                             midi_lane_channels: track.midi_lane_channels.clone(),

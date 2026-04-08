@@ -315,6 +315,11 @@ fn push_track_restore_actions(actions: &mut Vec<Action>, track: &Value) -> Resul
         midi_ins,
         audio_outs: primary_audio_outs.min(audio_outs),
         midi_outs,
+        has_video: track
+            .get("has_video")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || track.get("video").is_some_and(|value| !value.is_null()),
     });
     for _ in primary_audio_ins.min(audio_ins)..audio_ins {
         actions.push(Action::TrackAddAudioInput(name.clone()));
@@ -1054,8 +1059,8 @@ mod tests {
 
         assert!(actions.iter().any(|action| matches!(
             action,
-            Action::AddTrack { name, audio_ins, audio_outs, midi_ins, midi_outs }
-            if name == "Track 1" && *audio_ins == 2 && *audio_outs == 2 && *midi_ins == 1 && *midi_outs == 1
+            Action::AddTrack { name, audio_ins, audio_outs, midi_ins, midi_outs, has_video }
+            if name == "Track 1" && *audio_ins == 2 && *audio_outs == 2 && *midi_ins == 1 && *midi_outs == 1 && !has_video
         )));
         assert!(actions.iter().any(
             |action| matches!(action, Action::OpenMidiInputDevice(device) if device == "dev-in")

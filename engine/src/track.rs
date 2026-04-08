@@ -14,6 +14,7 @@ use crate::mutex::UnsafeMutex;
 use crate::vst3::Vst3Processor;
 use crate::{
     audio::io::AudioIO,
+    message::{VideoClipData, VideoFrameBuffer},
     midi::io::{MIDIIO, MidiEvent},
     rubberband::LivePitchShifter,
 };
@@ -455,6 +456,7 @@ pub struct Track {
     pub midi_lane_channels: Vec<Option<u8>>,
     primary_audio_ins: usize,
     primary_audio_outs: usize,
+    pub has_video: bool,
     pub audio: AudioTrack,
     pub midi: MIDITrack,
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -485,6 +487,8 @@ pub struct Track {
     meter_peak_hold_linear: Vec<f32>,
     pub record_tap_outs: Vec<Vec<f32>>,
     pub record_tap_midi_in: Vec<MidiEvent>,
+    pub video_clip: Option<VideoClipData>,
+    pub video_frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
     #[cfg(all(unix, not(target_os = "macos")))]
     pub lv2_state_base_dir: Option<PathBuf>,
     pub session_base_dir: Option<PathBuf>,
@@ -510,6 +514,7 @@ impl Track {
         audio_outs: usize,
         midi_ins: usize,
         midi_outs: usize,
+        has_video: bool,
         buffer_size: usize,
         sample_rate: f64,
     ) -> Self {
@@ -534,6 +539,7 @@ impl Track {
             midi_lane_channels: vec![None; midi_ins],
             primary_audio_ins: audio_ins,
             primary_audio_outs: audio_outs,
+            has_video,
             audio: AudioTrack::new(audio_ins, audio_outs, buffer_size),
             midi: MIDITrack::new(midi_ins, midi_outs),
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -564,6 +570,8 @@ impl Track {
             meter_peak_hold_linear: vec![0.0; audio_outs],
             record_tap_outs: vec![vec![0.0; buffer_size]; audio_outs],
             record_tap_midi_in: vec![],
+            video_clip: None,
+            video_frame: None,
             #[cfg(all(unix, not(target_os = "macos")))]
             lv2_state_base_dir: None,
             session_base_dir: None,
@@ -4448,7 +4456,7 @@ mod tests {
 
     #[test]
     fn default_audio_passthrough_uses_minimum_port_count() {
-        let track = Track::new("t".to_string(), 1, 2, 0, 0, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 2, 0, 0, false, 64, 48_000.0);
 
         assert_eq!(track.audio.ins.len(), 1);
         assert_eq!(track.audio.outs.len(), 2);
@@ -4470,7 +4478,7 @@ mod tests {
 
     #[test]
     fn default_midi_passthrough_uses_minimum_port_count() {
-        let track = Track::new("t".to_string(), 0, 0, 1, 2, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 0, 0, 1, 2, false, 64, 48_000.0);
 
         assert_eq!(track.midi.ins.len(), 1);
         assert_eq!(track.midi.outs.len(), 2);
@@ -4493,7 +4501,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn plugin_graph_includes_default_track_midi_passthrough() {
-        let track = Track::new("t".to_string(), 0, 0, 1, 2, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 0, 0, 1, 2, false, 64, 48_000.0);
         let connections = track.plugin_graph_connections();
 
         assert!(connections.iter().any(|c| {
@@ -4514,7 +4522,7 @@ mod tests {
 
     #[test]
     fn track_input_passthrough_respects_input_monitor() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 8, 48_000.0);
         let source = Arc::new(AudioIO::new(8));
         source.buffer.lock()[0] = 0.5;
         source.buffer.lock()[1] = -0.25;
@@ -4535,7 +4543,7 @@ mod tests {
 
     #[test]
     fn clip_playback_audible_with_input_monitor_off() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 8, 48_000.0);
         track.input_monitor = false;
         track.disk_monitor = true;
         let mut clip = AudioClip::new("clip".to_string(), 0, 4);
@@ -4556,7 +4564,7 @@ mod tests {
 
     #[test]
     fn record_tap_captures_live_input_with_disk_monitor_on_and_input_monitor_off() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 8, 48_000.0);
         track.input_monitor = false;
         track.disk_monitor = true;
         track.armed = true;
@@ -4574,7 +4582,7 @@ mod tests {
 
     #[test]
     fn record_tap_falls_back_to_direct_input_when_no_internal_route_exists() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 8, 48_000.0);
         track.input_monitor = false;
         track.disk_monitor = true;
         track.armed = true;
@@ -4593,7 +4601,7 @@ mod tests {
 
     #[test]
     fn clip_playback_respects_clip_playback_enabled_flag() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 8, 48_000.0);
         track.input_monitor = false;
         track.disk_monitor = true;
         track.clip_playback_enabled = false;
@@ -4621,7 +4629,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn disconnecting_one_stereo_internal_channel_mutes_only_that_channel() {
-        let mut track = Track::new("t".to_string(), 2, 2, 0, 0, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 2, 2, 0, 0, false, 8, 48_000.0);
         let left = Arc::new(AudioIO::new(8));
         let right = Arc::new(AudioIO::new(8));
         left.buffer.lock()[0] = 0.25;
@@ -4808,7 +4816,7 @@ mod tests {
 
     #[test]
     fn transport_timing_and_loop_config_clamp_invalid_values() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 8, 48_000.0);
 
         track.set_transport_timing(0.0, 0, 0);
         assert_eq!(track.tempo_bpm, 1.0);
@@ -4822,7 +4830,7 @@ mod tests {
 
     #[test]
     fn cycle_segments_wrap_across_loop_boundary() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 8, 48_000.0);
         track.transport_sample = 14;
         track.loop_enabled = true;
         track.loop_range_samples = Some((10, 16));
@@ -4833,7 +4841,7 @@ mod tests {
 
     #[test]
     fn offline_bounce_restores_transport_and_monitor_state() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 8, 48_000.0);
         track.transport_sample = 123;
         track.disk_monitor = false;
         track.input_monitor = true;
@@ -4864,7 +4872,7 @@ mod tests {
 
     #[test]
     fn midi_only_track_clip_playback_generates_hw_midi_events() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, false, 8, 48_000.0);
         track.disk_monitor = true;
         track.clip_playback_enabled = true;
         track.midi.clips.push(crate::midi::clip::MIDIClip::new(
@@ -4889,7 +4897,7 @@ mod tests {
 
     #[test]
     fn midi_lane_channel_filters_monitored_input() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, false, 8, 48_000.0);
         track.input_monitor = true;
         track.set_midi_lane_channel(0, Some(1));
         track.push_hw_midi_events_to_port(
@@ -4915,7 +4923,7 @@ mod tests {
 
     #[test]
     fn midi_lane_channel_omni_does_not_filter_input() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, false, 8, 48_000.0);
         track.input_monitor = true;
         track.set_midi_lane_channel(0, None);
         track.push_hw_midi_events_to_port(
@@ -4934,7 +4942,7 @@ mod tests {
 
     #[test]
     fn grouped_audio_playback_sums_child_buffers() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 8, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 8, 48_000.0);
         track.input_monitor = false;
         track.disk_monitor = true;
 

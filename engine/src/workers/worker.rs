@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn prepare_track_for_freeze_render_neutralizes_level_and_balance() {
-        let mut track = Track::new("track".to_string(), 1, 2, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("track".to_string(), 1, 2, 0, 0, false, 64, 48_000.0);
         track.set_level(-6.0);
         track.set_balance(0.35);
 
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn freeze_automation_ignores_volume_and_balance_lanes() {
-        let mut track = Track::new("track".to_string(), 1, 2, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("track".to_string(), 1, 2, 0, 0, false, 64, 48_000.0);
         let lanes = vec![
             OfflineAutomationLane {
                 target: OfflineAutomationTarget::Volume,
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn freeze_automation_applies_interpolated_mute_lane() {
-        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         let lanes = vec![OfflineAutomationLane {
             target: OfflineAutomationTarget::Mute,
             points: vec![
@@ -534,7 +534,7 @@ mod tests {
             rx: rx_unused,
             tx,
         };
-        let mut track = Track::new("track".to_string(), 1, 2, 0, 0, 4, 48_000.0);
+        let mut track = Track::new("track".to_string(), 1, 2, 0, 0, false, 4, 48_000.0);
         track.set_level(-9.0);
         track.set_balance(-0.3);
         let state = make_state_with_track(track);
@@ -574,7 +574,7 @@ mod tests {
             rx: rx_unused,
             tx,
         };
-        let mut track = Track::new("track".to_string(), 1, 2, 0, 0, 4, 48_000.0);
+        let mut track = Track::new("track".to_string(), 1, 2, 0, 0, false, 4, 48_000.0);
         track.set_level(-4.0);
         track.set_balance(0.25);
         let state = make_state_with_track(track);
@@ -623,7 +623,7 @@ mod tests {
             rx: rx_unused,
             tx,
         };
-        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 4, 48_000.0);
+        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, false, 4, 48_000.0);
         track.set_level(-3.0);
         track.set_balance(0.4);
         let state = make_state_with_track(track);

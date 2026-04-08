@@ -1,7 +1,9 @@
 use super::{AudioClip, MIDIClip};
 use crate::message::{TrackAutomationMode, TrackAutomationTarget};
 use iced::Point;
+use maolan_engine::{message::VideoFrameBuffer, mutex::UnsafeMutex};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::sync::Arc;
 
 pub use crate::consts::state_track::{
     TRACK_FOLDER_HEADER_HEIGHT, TRACK_SUBTRACK_GAP, TRACK_SUBTRACK_MIN_HEIGHT,
@@ -12,6 +14,7 @@ pub struct TrackLaneLayout {
     pub header_height: f32,
     pub lane_height: f32,
     pub audio_lanes: usize,
+    pub video_lanes: usize,
     pub midi_lanes: usize,
 }
 
@@ -47,6 +50,16 @@ impl MIDIData {
             outs,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct VideoClip {
+    pub path: String,
+    pub start: usize,
+    pub length: usize,
+    pub offset: usize,
+    #[serde(skip, default)]
+    pub frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +152,10 @@ pub struct Track {
     #[serde(default)]
     pub primary_audio_outs: usize,
     pub audio: AudioData,
+    #[serde(default)]
+    pub has_video: bool,
+    #[serde(default)]
+    pub video: Option<VideoClip>,
     pub midi: MIDIData,
     #[serde(default)]
     pub midi_lane_channels: Vec<Option<u8>>,
@@ -170,6 +187,7 @@ impl Track {
         audio_outs: usize,
         midi_ins: usize,
         midi_outs: usize,
+        has_video: bool,
     ) -> Self {
         let mut track = Self {
             id: 0,
@@ -192,6 +210,8 @@ impl Track {
             vca_master: None,
             frozen: false,
             audio: AudioData::new(audio_ins, audio_outs),
+            has_video,
+            video: None,
             midi: MIDIData::new(midi_ins, midi_outs),
             midi_lane_channels: vec![None; midi_ins],
             primary_audio_ins: audio_ins,
@@ -242,6 +262,10 @@ impl Track {
         self.midi.ins
     }
 
+    pub fn video_lane_count(&self) -> usize {
+        usize::from(self.has_video || self.video.is_some())
+    }
+
     pub fn automation_lane_count(&self) -> usize {
         self.automation_lanes
             .iter()
@@ -251,6 +275,7 @@ impl Track {
 
     pub fn total_lane_count(&self) -> usize {
         self.audio_lane_count()
+            .saturating_add(self.video_lane_count())
             .saturating_add(self.midi_lane_count())
             .saturating_add(self.automation_lane_count())
     }
@@ -272,6 +297,7 @@ impl Track {
             header_height: TRACK_FOLDER_HEADER_HEIGHT,
             lane_height,
             audio_lanes: self.audio_lane_count(),
+            video_lanes: self.video_lane_count(),
             midi_lanes: self.midi_lane_count(),
         }
     }
@@ -285,11 +311,17 @@ impl Track {
                     * (layout.lane_height + TRACK_SUBTRACK_GAP)
             }
             maolan_engine::kind::Kind::MIDI => {
-                y += layout.audio_lanes as f32 * (layout.lane_height + TRACK_SUBTRACK_GAP);
+                y += (layout.audio_lanes + layout.video_lanes) as f32
+                    * (layout.lane_height + TRACK_SUBTRACK_GAP);
                 y + lane.min(layout.midi_lanes.saturating_sub(1)) as f32
                     * (layout.lane_height + TRACK_SUBTRACK_GAP)
             }
         }
+    }
+
+    pub fn video_lane_top(&self) -> f32 {
+        let layout = self.lane_layout();
+        layout.header_height + layout.audio_lanes as f32 * (layout.lane_height + TRACK_SUBTRACK_GAP)
     }
 
     pub fn lane_index_at_y(&self, kind: maolan_engine::kind::Kind, y: f32) -> usize {
@@ -305,7 +337,8 @@ impl Track {
                 }
             }
             maolan_engine::kind::Kind::MIDI => {
-                let midi_local = local - (layout.audio_lanes as f32 * lane_span);
+                let midi_local =
+                    local - ((layout.audio_lanes + layout.video_lanes) as f32 * lane_span);
                 if layout.midi_lanes == 0 {
                     0
                 } else {
@@ -318,7 +351,9 @@ impl Track {
     pub fn automation_lane_top(&self, lane: usize) -> f32 {
         let layout = self.lane_layout();
         let lane_span = layout.lane_height + TRACK_SUBTRACK_GAP;
-        layout.header_height + (layout.audio_lanes + layout.midi_lanes + lane) as f32 * lane_span
+        layout.header_height
+            + (layout.audio_lanes + layout.video_lanes + layout.midi_lanes + lane) as f32
+                * lane_span
     }
 }
 
@@ -380,6 +415,7 @@ mod tests {
             header_height: 24.0,
             lane_height: 80.0,
             audio_lanes: 2,
+            video_lanes: 1,
             midi_lanes: 1,
         };
         assert_eq!(layout.header_height, 24.0);

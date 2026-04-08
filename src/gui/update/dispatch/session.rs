@@ -29,6 +29,7 @@ impl Maolan {
                     midi_ins,
                     audio_outs,
                     midi_outs,
+                    has_video: false,
                 });
 
                 self.state

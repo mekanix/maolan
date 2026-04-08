@@ -2113,6 +2113,7 @@ impl Maolan {
                             audio_outs,
                             midi_ins,
                             midi_outs,
+                            has_video,
                         } => {
                             let mut state = self.state.blocking_write();
                             state.tracks.push(Track::new(
@@ -2122,6 +2123,7 @@ impl Maolan {
                                 *audio_outs,
                                 *midi_ins,
                                 *midi_outs,
+                                *has_video,
                             ));
 
                             if let Some(position) = state.pending_track_positions.remove(name)
@@ -6669,9 +6671,16 @@ impl Maolan {
                     async {
                         let files = AsyncFileDialog::new()
                             .set_title("Import files")
-                            .add_filter("Audio/MIDI", &["wav", "ogg", "mp3", "flac", "mid", "midi"])
+                            .add_filter(
+                                "Media",
+                                &[
+                                    "wav", "ogg", "mp3", "flac", "mid", "midi", "mp4", "mov",
+                                    "mkv", "webm", "avi", "m4v",
+                                ],
+                            )
                             .add_filter("Audio", &["wav", "ogg", "mp3", "flac"])
                             .add_filter("MIDI", &["mid", "midi"])
+                            .add_filter("Video", &["mp4", "mov", "mkv", "webm", "avi", "m4v"])
                             .pick_files()
                             .await;
                         files.map(|handles| {
@@ -6826,6 +6835,7 @@ impl Maolan {
                                                     midi_ins: 0,
                                                     audio_outs: channels,
                                                     midi_outs: 0,
+                                                    has_video: false,
                                                 }))
                                                 .await
                                             {
@@ -6870,6 +6880,186 @@ impl Maolan {
                                             failures.push(format!("{} ({e})", path.display()));
                                         }
                                     }
+                                } else if Self::is_import_video_path(path) {
+                                    if tx
+                                        .send(Message::ImportProgress {
+                                            file_index,
+                                            total_files,
+                                            file_progress: 0.2,
+                                            filename: filename.clone(),
+                                            operation: Some("Inspecting video".to_string()),
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+
+                                    match Self::video_stream_info(path, playback_rate) {
+                                        Ok((has_audio, video_length)) => {
+                                            let video_rel = match Self::import_video_to_session(
+                                                path,
+                                                &session_root,
+                                            ) {
+                                                Ok(rel) => rel,
+                                                Err(e) => {
+                                                    failures
+                                                        .push(format!("{} ({e})", path.display()));
+                                                    continue;
+                                                }
+                                            };
+                                            let base = Self::import_track_base_name(path);
+                                            let track_name =
+                                                Self::unique_track_name(&base, &mut used_names);
+
+                                            let mut audio_rel = None;
+                                            let mut channels = 0usize;
+                                            let mut audio_length = 0usize;
+                                            let mut peaks = None;
+                                            if has_audio {
+                                                match Self::import_embedded_video_audio_to_session_wav_with_progress(
+                                                    path,
+                                                    &session_root,
+                                                    playback_rate as u32,
+                                                    |progress, operation| {
+                                                        let _ = tx.send(Message::ImportProgress {
+                                                            file_index,
+                                                            total_files,
+                                                            file_progress: 0.2 + progress * 0.7,
+                                                            filename: filename.clone(),
+                                                            operation,
+                                                        });
+                                                    },
+                                                )
+                                                .await
+                                                {
+                                                    Ok((clip_rel, clip_channels, length, clip_peaks)) => {
+                                                        audio_rel = Some(clip_rel);
+                                                        channels = clip_channels;
+                                                        audio_length = length;
+                                                        peaks = Some(clip_peaks);
+                                                    }
+                                                    Err(e) => {
+                                                        failures.push(format!(
+                                                            "{} (audio import failed, video imported: {e})",
+                                                            path.display()
+                                                        ));
+                                                    }
+                                                }
+                                            } else if tx
+                                                .send(Message::ImportProgress {
+                                                    file_index,
+                                                    total_files,
+                                                    file_progress: 0.9,
+                                                    filename: filename.clone(),
+                                                    operation: Some("Copying video".to_string()),
+                                                })
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+
+                                            if let Err(e) = CLIENT
+                                                .send(EngineMessage::Request(Action::AddTrack {
+                                                    name: track_name.clone(),
+                                                    audio_ins: channels,
+                                                    midi_ins: 0,
+                                                    audio_outs: channels,
+                                                    midi_outs: 0,
+                                                    has_video: true,
+                                                }))
+                                                .await
+                                            {
+                                                failures.push(format!("{} ({e})", path.display()));
+                                                continue;
+                                            }
+                                            if let Err(e) = CLIENT
+                                                .send(EngineMessage::Request(
+                                                    Action::SetTrackVideoClip {
+                                                        track_name: track_name.clone(),
+                                                        clip: Some(
+                                                            maolan_engine::message::VideoClipData {
+                                                                path: video_rel,
+                                                                start: 0,
+                                                                length: video_length,
+                                                                offset: 0,
+                                                            },
+                                                        ),
+                                                    },
+                                                ))
+                                                .await
+                                            {
+                                                failures.push(format!("{} ({e})", path.display()));
+                                                continue;
+                                            }
+
+                                            if let Some(clip_rel) = audio_rel {
+                                                if let Some(peaks) = peaks
+                                                    && tx
+                                                        .send(Message::ImportPreparedAudioPeaks {
+                                                            track_name: track_name.clone(),
+                                                            clip_name: clip_rel.clone(),
+                                                            start: 0,
+                                                            length: audio_length,
+                                                            offset: 0,
+                                                            peaks,
+                                                        })
+                                                        .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                if let Err(e) = CLIENT
+                                                    .send(EngineMessage::Request(Action::AddClip {
+                                                        name: clip_rel,
+                                                        track_name,
+                                                        start: 0,
+                                                        length: audio_length,
+                                                        offset: 0,
+                                                        input_channel: 0,
+                                                        muted: false,
+                                                        peaks_file: None,
+                                                        kind: Kind::Audio,
+                                                        fade_enabled: true,
+                                                        fade_in_samples: 240,
+                                                        fade_out_samples: 240,
+                                                        source_name: None,
+                                                        source_offset: None,
+                                                        source_length: None,
+                                                        preview_name: None,
+                                                        pitch_correction_points: vec![],
+                                                        pitch_correction_frame_likeness: None,
+                                                        pitch_correction_inertia_ms: None,
+                                                        pitch_correction_formant_compensation: None,
+                                                        plugin_graph_json: Some(
+                                                            Maolan::default_clip_plugin_graph_json(
+                                                                channels, channels,
+                                                            ),
+                                                        ),
+                                                    }))
+                                                    .await
+                                                {
+                                                    failures
+                                                        .push(format!("{} ({e})", path.display()));
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            failures.push(format!("{} ({e})", path.display()));
+                                        }
+                                    }
+
+                                    if tx
+                                        .send(Message::ImportProgress {
+                                            file_index,
+                                            total_files,
+                                            file_progress: 1.0,
+                                            filename: filename.clone(),
+                                            operation: None,
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 } else if Self::is_import_midi_path(path) {
                                     if tx
                                         .send(Message::ImportProgress {
@@ -6901,6 +7091,7 @@ impl Maolan {
                                                     midi_ins: 1,
                                                     audio_outs: 0,
                                                     midi_outs: 1,
+                                                    has_video: false,
                                                 }))
                                                 .await
                                             {
@@ -7267,6 +7458,7 @@ impl Maolan {
                             midi_ins: 0,
                             audio_outs: channels,
                             midi_outs: 0,
+                            has_video: false,
                         }))
                         .await
                     {

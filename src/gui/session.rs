@@ -117,6 +117,7 @@ impl Maolan {
         fs::create_dir_all(template_root.join("plugins"))?;
         fs::create_dir_all(template_root.join("audio"))?;
         fs::create_dir_all(template_root.join("midi"))?;
+        fs::create_dir_all(template_root.join("video"))?;
         fs::create_dir_all(template_root.join("peaks"))?;
         info!("Created template directories in: {}", path);
 
@@ -144,6 +145,9 @@ impl Maolan {
                 // Clear MIDI clips
                 if let Some(midi) = track.get_mut("midi").and_then(Value::as_object_mut) {
                     midi.insert("clips".to_string(), Value::Array(vec![]));
+                }
+                if let Some(obj) = track.as_object_mut() {
+                    obj.insert("video".to_string(), Value::Null);
                 }
                 if let Some(obj) = track.as_object_mut() {
                     obj.insert("frozen".to_string(), Value::Bool(false));
@@ -659,6 +663,7 @@ impl Maolan {
         fs::create_dir_all(session_root.join("plugins"))?;
         fs::create_dir_all(session_root.join("audio"))?;
         fs::create_dir_all(session_root.join("midi"))?;
+        fs::create_dir_all(session_root.join("video"))?;
         fs::create_dir_all(session_root.join("peaks"))?;
         fs::create_dir_all(session_root.join("pitch"))?;
         let file = File::create(&p)?;
@@ -756,6 +761,38 @@ impl Maolan {
                         );
                     }
                     clip["name"] = Value::String(rel);
+                }
+
+                if let Some(video) = track.get_mut("video").and_then(Value::as_object_mut)
+                    && let Some(name) = video.get("path").and_then(Value::as_str)
+                {
+                    let src_path = {
+                        let p = PathBuf::from(name);
+                        if p.is_absolute() {
+                            p
+                        } else {
+                            let in_session = session_root.join(&p);
+                            if in_session.exists() { in_session } else { p }
+                        }
+                    };
+                    let basename = Path::new(name)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("clip.mp4");
+                    let rel = format!("video/{basename}");
+                    let dst_path = session_root.join(&rel);
+                    if src_path.exists()
+                        && src_path.is_file()
+                        && src_path != dst_path
+                        && let Err(err) = fs::copy(&src_path, &dst_path)
+                    {
+                        error!(
+                            "Failed to copy video clip '{}' to '{}': {err}",
+                            src_path.display(),
+                            dst_path.display()
+                        );
+                    }
+                    video.insert("path".to_string(), Value::String(rel));
                 }
             }
         }
@@ -1461,6 +1498,11 @@ impl Maolan {
                     audio_outs: primary_audio_outs.min(audio_outs),
                     midi_ins,
                     midi_outs,
+                    has_video: track
+                        .get("has_video")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        || track.get("video").is_some_and(|value| !value.is_null()),
                 });
                 for _ in primary_audio_ins.min(audio_ins)..audio_ins {
                     restore_actions.push(Action::TrackAddAudioInput(name.clone()));
@@ -1864,6 +1906,31 @@ impl Maolan {
                             plugin_graph_json: None,
                         });
                     }
+                }
+
+                if let Some(video) = track.get("video").and_then(Value::as_object)
+                    && let Some(path) = video.get("path").and_then(Value::as_str)
+                {
+                    let start = video.get("start").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let length = video.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let offset = video.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let video_path = session_root.join(path);
+                    if !video_path.exists() {
+                        warnings.push(format!(
+                            "Missing video file for track '{}': {}",
+                            name,
+                            video_path.display()
+                        ));
+                    }
+                    restore_actions.push(Action::SetTrackVideoClip {
+                        track_name: name.clone(),
+                        clip: Some(maolan_engine::message::VideoClipData {
+                            path: path.to_string(),
+                            start,
+                            length,
+                            offset,
+                        }),
+                    });
                 }
             }
         } else {

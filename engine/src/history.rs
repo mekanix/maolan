@@ -185,6 +185,7 @@ pub fn create_inverse_action(action: &Action, state: &State) -> Option<Action> {
                 midi_ins: track_lock.midi.ins.len(),
                 audio_outs: track_lock.primary_audio_outs(),
                 midi_outs: track_lock.midi.outs.len(),
+                has_video: track_lock.has_video,
             })
         }
 
@@ -959,6 +960,7 @@ pub fn create_inverse_actions(action: &Action, state: &State) -> Option<Vec<Acti
                 midi_ins: track.midi.ins.len(),
                 audio_outs: track.primary_audio_outs(),
                 midi_outs: track.midi.outs.len(),
+                has_video: track.has_video,
             });
             for _ in track.primary_audio_ins()..track.audio.ins.len() {
                 actions.push(Action::TrackAddAudioInput(track.name.clone()));
@@ -1403,7 +1405,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_add_clip_targets_next_clip_index() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         track
             .audio
             .clips
@@ -1454,7 +1456,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_set_clip_bounds_restores_previous_audio_bounds() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         let mut clip = AudioClip::new("clip".to_string(), 10, 30);
         clip.offset = 7;
         track.audio.clips.push(clip);
@@ -1495,7 +1497,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_set_clip_bounds_restores_previous_midi_bounds() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, false, 64, 48_000.0);
         track.midi.clips.push(crate::midi::clip::MIDIClip {
             name: "pattern.mid".to_string(),
             start: 24,
@@ -1540,7 +1542,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_set_clip_muted_restores_audio_and_midi_flags() {
-        let mut track = Track::new("t".to_string(), 1, 1, 1, 1, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 1, 1, false, 64, 48_000.0);
         let mut audio_clip = AudioClip::new("audio.wav".to_string(), 0, 16);
         audio_clip.muted = true;
         track.audio.clips.push(audio_clip);
@@ -1593,7 +1595,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_rename_clip_restores_previous_name() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         track
             .audio
             .clips
@@ -1619,7 +1621,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_track_set_vca_master_restores_none() {
-        let track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         let state = make_state_with_track(track);
 
         let inverse = create_inverse_action(
@@ -1639,7 +1641,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_audio_clip_restores_peaks_file() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         let mut clip = AudioClip::new("audio/clip.wav".to_string(), 48, 144);
         clip.offset = 12;
         clip.input_channel = 0;
@@ -1687,7 +1689,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_grouped_audio_clip_restores_group() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         let mut group = AudioClip::new("Group".to_string(), 48, 144);
         group
             .grouped_clips
@@ -1726,7 +1728,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_midi_clip_restores_clip() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, false, 64, 48_000.0);
         track.midi.clips.push(crate::midi::clip::MIDIClip {
             name: "pattern.mid".to_string(),
             start: 48,
@@ -1775,7 +1777,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_grouped_midi_clip_restores_group() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, false, 64, 48_000.0);
         let mut group = crate::midi::clip::MIDIClip::new("Group".to_string(), 32, 160);
         group.grouped_clips.push(crate::midi::clip::MIDIClip::new(
             "child.mid".to_string(),
@@ -1816,7 +1818,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_grouped_audio_clip_preserves_child_metadata() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         let mut child = AudioClip::new("child.wav".to_string(), 4, 40);
         child.peaks_file = Some("peaks/child.json".to_string());
         child.pitch_correction_source_name = Some("source.wav".to_string());
@@ -1872,7 +1874,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_remove_grouped_midi_clip_preserves_child_structure() {
-        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 0, 0, 1, 1, false, 64, 48_000.0);
         let child = crate::midi::clip::MIDIClip::new("child.mid".to_string(), 0, 48);
         let mut group = crate::midi::clip::MIDIClip::new("Group".to_string(), 32, 160);
         group.grouped_clips.push(child);
@@ -1905,7 +1907,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_set_clip_pitch_correction_restores_previous_values() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         let mut clip = AudioClip::new("audio.wav".to_string(), 0, 128);
         clip.pitch_correction_preview_name = Some("audio_preview.wav".to_string());
         clip.pitch_correction_source_name = Some("audio_source.wav".to_string());
@@ -1972,12 +1974,12 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_clip_copy_targets_new_destination_clip() {
-        let mut source = Track::new("src".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut source = Track::new("src".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         source
             .audio
             .clips
             .push(AudioClip::new("source.wav".to_string(), 12, 48));
-        let mut dest = Track::new("dst".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut dest = Track::new("dst".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         dest.audio
             .clips
             .push(AudioClip::new("existing.wav".to_string(), 0, 24));
@@ -2026,7 +2028,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_same_track_clip_move_reverses_last_destination_clip() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         let mut original = AudioClip::new("clip.wav".to_string(), 20, 40);
         original.input_channel = 2;
         let moved = AudioClip::new("moved.wav".to_string(), 80, 32);
@@ -2073,7 +2075,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_track_midi_binding_restores_previous_binding() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         track.midi_learn_volume = Some(binding(7));
         let state = make_state_with_track(track);
 
@@ -2103,7 +2105,7 @@ mod tests {
 
     #[test]
     fn create_inverse_action_for_vst3_load_uses_next_runtime_instance_id() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         track.next_plugin_instance_id = 42;
         let state = make_state_with_track(track);
 
@@ -2131,7 +2133,7 @@ mod tests {
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
     fn create_inverse_action_for_lv2_load_uses_next_runtime_instance_id() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         track.next_lv2_instance_id = 5;
         let state = make_state_with_track(track);
 
@@ -2158,7 +2160,7 @@ mod tests {
 
     #[test]
     fn create_inverse_actions_for_clear_all_midi_learn_bindings_restores_only_existing_bindings() {
-        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         track.midi_learn_volume = Some(binding(7));
         track.midi_learn_disk_monitor = Some(binding(64));
         let state = make_state_with_track(track);
@@ -2190,7 +2192,7 @@ mod tests {
 
     #[test]
     fn create_inverse_actions_for_remove_track_restores_io_flags_and_bindings() {
-        let mut track = Track::new("t".to_string(), 1, 1, 1, 1, 64, 48_000.0);
+        let mut track = Track::new("t".to_string(), 1, 1, 1, 1, false, 64, 48_000.0);
         track.level = -3.0;
         track.balance = 0.25;
         track.armed = true;
@@ -2215,6 +2217,7 @@ mod tests {
                 audio_outs: 1,
                 midi_ins: 1,
                 midi_outs: 1,
+                has_video: false,
             }) if name == "t"
         ));
         assert!(

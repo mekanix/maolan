@@ -479,6 +479,7 @@ impl fmt::Display for ExportBitDepth {
 pub enum AddTrack {
     Name(String),
     Count(usize),
+    VideoSubtrack(bool),
     AudioIns(usize),
     AudioOuts(usize),
     MIDIIns(usize),

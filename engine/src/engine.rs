@@ -57,6 +57,7 @@ use crate::{
     routing,
     state::State,
     track::Track,
+    video,
     workers::worker::Worker,
 };
 
@@ -248,6 +249,38 @@ impl Engine {
     const MIDI_CC_ALL_SOUND_OFF: u8 = 120;
     const MIDI_CC_ALL_NOTES_OFF: u8 = 123;
     const MIDI_CC_SUSTAIN_PEDAL: u8 = 64;
+
+    fn request_track_video_frame(&self, track_name: &str) {
+        let Some(track_handle) = self.state.lock().tracks.get(track_name).cloned() else {
+            return;
+        };
+        let (clip, sample_rate) = {
+            let track = track_handle.lock();
+            let Some(clip) = track.video_clip.clone() else {
+                return;
+            };
+            (clip, track.sample_rate)
+        };
+
+        let tx = self.tx.clone();
+        let track_name = track_name.to_string();
+        tokio::spawn(async move {
+            match video::decode_iframe_preview_strip(&clip, sample_rate) {
+                Ok(buffer) => {
+                    let _ = tx
+                        .send(Message::Response(Ok(Action::TrackVideoFrame {
+                            track_name,
+                            buffer,
+                            clip,
+                        })))
+                        .await;
+                }
+                Err(err) => {
+                    let _ = tx.send(Message::Response(Err(err))).await;
+                }
+            }
+        });
+    }
 
     fn default_clip_plugin_graph_json(audio_ins: usize, audio_outs: usize) -> serde_json::Value {
         let connections = (0..audio_ins.min(audio_outs))
@@ -817,6 +850,7 @@ impl Engine {
             let _ = std::fs::create_dir_all(root.join("plugins"));
             let _ = std::fs::create_dir_all(root.join("audio"));
             let _ = std::fs::create_dir_all(root.join("midi"));
+            let _ = std::fs::create_dir_all(root.join("video"));
         }
     }
 
@@ -1022,6 +1056,7 @@ impl Engine {
                 1,
                 0,
                 0,
+                false,
                 cycle_samples.max(1),
                 sample_rate_hz.max(1.0),
             )))),
@@ -1036,6 +1071,7 @@ impl Engine {
             midi_ins: 0,
             audio_outs: 1,
             midi_outs: 0,
+            has_video: false,
         }))
         .await;
         self.notify_clients(Ok(Action::TrackLevel(
@@ -3796,6 +3832,7 @@ impl Engine {
                 midi_ins,
                 audio_outs,
                 midi_outs,
+                has_video,
             } => {
                 let tracks = &mut self.state.lock().tracks;
                 if tracks.contains_key(name) {
@@ -3813,7 +3850,20 @@ impl Engine {
                     None
                 };
 
-                if let Some((chsamples, sample_rate)) = maybe_hw {
+                let maybe_track_timing = maybe_hw.or_else(|| {
+                    if has_video
+                        && audio_ins == 0
+                        && audio_outs == 0
+                        && midi_ins == 0
+                        && midi_outs == 0
+                    {
+                        Some((64, 48_000.0))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some((chsamples, sample_rate)) = maybe_track_timing {
                     tracks.insert(
                         name.clone(),
                         Arc::new(UnsafeMutex::new(Box::new(Track::new(
@@ -3822,6 +3872,7 @@ impl Engine {
                             audio_outs,
                             midi_ins,
                             midi_outs,
+                            has_video,
                             chsamples,
                             sample_rate,
                         )))),
@@ -3846,7 +3897,7 @@ impl Engine {
                     }
                 } else {
                     self.notify_clients(Err(
-                        "Engine needs to open audio device before adding audio track".to_string(),
+                        "Engine needs to open audio device before adding this track".to_string(),
                     ))
                     .await;
                 }
@@ -4071,6 +4122,15 @@ impl Engine {
             }
             Action::TrackMeters { .. } => {}
             Action::MeterSnapshot { .. } => {}
+            Action::TrackVideoFrame {
+                ref track_name,
+                ref buffer,
+                ..
+            } => {
+                if let Some(track) = self.state.lock().tracks.get(track_name) {
+                    track.lock().video_frame = Some(buffer.clone());
+                }
+            }
             Action::TrackToggleArm(ref name) => {
                 if self.reject_if_track_frozen(name, "arming/disarming").await {
                     return;
@@ -5463,6 +5523,25 @@ impl Engine {
                     midi_clip.clone(),
                 );
             }
+            Action::SetTrackVideoClip {
+                ref track_name,
+                ref clip,
+            } => {
+                let track = match self.track_handle_or_err(track_name) {
+                    Ok(track) => track,
+                    Err(e) => {
+                        self.notify_clients(Err(e)).await;
+                        return;
+                    }
+                };
+                let track = track.lock();
+                track.video_clip = clip.clone();
+                track.has_video = track.has_video || clip.is_some();
+                track.video_frame = None;
+                if clip.is_some() {
+                    self.request_track_video_frame(track_name);
+                }
+            }
             Action::RemoveClip {
                 ref track_name,
                 kind,
@@ -6701,7 +6780,7 @@ mod tests {
         let (mut engine, mut client_rx) = make_engine_with_client();
         insert_track(
             &mut engine,
-            Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0),
+            Track::new("track".to_string(), 1, 1, 0, 0, false, 64, 48_000.0),
         );
 
         engine
@@ -6751,7 +6830,7 @@ mod tests {
     #[tokio::test]
     async fn reject_if_track_frozen_sends_error_and_blocks_operation() {
         let (mut engine, mut client_rx) = make_engine_with_client();
-        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0);
+        let mut track = Track::new("track".to_string(), 1, 1, 0, 0, false, 64, 48_000.0);
         track.set_frozen(true);
         insert_track(&mut engine, track);
 
@@ -6773,7 +6852,7 @@ mod tests {
         let (mut engine, _client_rx) = make_engine_with_client();
         insert_track(
             &mut engine,
-            Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0),
+            Track::new("track".to_string(), 1, 1, 0, 0, false, 64, 48_000.0),
         );
 
         engine
@@ -6822,7 +6901,7 @@ mod tests {
         let (mut engine, mut client_rx) = make_engine_with_client();
         insert_track(
             &mut engine,
-            Track::new("track".to_string(), 1, 1, 0, 0, 64, 48_000.0),
+            Track::new("track".to_string(), 1, 1, 0, 0, false, 64, 48_000.0),
         );
         let (worker_tx, worker_rx) = channel(1);
         drop(worker_rx);

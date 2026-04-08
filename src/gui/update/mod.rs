@@ -3293,7 +3293,7 @@ mod tests {
         let app = Maolan::default();
         {
             let mut state = app.state.blocking_write();
-            let mut track = Track::new("track".to_string(), 1.0, 1, 1, 0, 0);
+            let mut track = Track::new("track".to_string(), 1.0, 1, 1, 0, 0, false);
             track.audio.clips.push(AudioClip {
                 name: "audio/clip.wav".to_string(),
                 start: 12,

@@ -1753,12 +1753,15 @@ impl Maolan {
     }
 
     fn is_cleanup_target_rel(path: &str) -> bool {
-        if path.starts_with("audio/") || path.starts_with("midi/") {
+        if path.starts_with("audio/") || path.starts_with("midi/") || path.starts_with("video/") {
             let rel_path = Path::new(path);
             let Some(ext) = Self::file_extension_lower(rel_path) else {
                 return false;
             };
-            if matches!(ext.as_str(), "wav" | "mid" | "midi") {
+            if matches!(
+                ext.as_str(),
+                "wav" | "mid" | "midi" | "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v"
+            ) {
                 return true;
             }
             if path.starts_with("audio/") && ext == "txt" {
@@ -1830,6 +1833,9 @@ impl Maolan {
             }
             for clip in &track.midi.clips {
                 Self::insert_referenced_session_media_path(&mut referenced, &clip.name);
+            }
+            if let Some(video) = &track.video {
+                Self::insert_referenced_session_media_path(&mut referenced, &video.path);
             }
             for clip in &track.frozen_audio_backup {
                 Self::insert_referenced_session_media_path(&mut referenced, &clip.name);
@@ -1913,6 +1919,13 @@ impl Maolan {
         )
         .map_err(|e| format!("Failed to scan midi/: {e}"))?;
         Self::collect_cleanup_candidate_files(
+            &session_root.join("video"),
+            session_root,
+            &referenced,
+            &mut candidates,
+        )
+        .map_err(|e| format!("Failed to scan video/: {e}"))?;
+        Self::collect_cleanup_candidate_files(
             &session_root.join("peaks"),
             session_root,
             &referenced,
@@ -1943,6 +1956,13 @@ impl Maolan {
         matches!(
             Self::file_extension_lower(path).as_deref(),
             Some("wav" | "ogg" | "mp3" | "flac")
+        )
+    }
+
+    fn is_import_video_path(path: &Path) -> bool {
+        matches!(
+            Self::file_extension_lower(path).as_deref(),
+            Some("mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v")
         )
     }
 
@@ -2286,6 +2306,119 @@ impl Maolan {
         progress_callback(1.0, None);
         let frames = final_samples.len() / channels.max(1);
         Ok((rel, channels.max(1), frames.max(1), peaks))
+    }
+
+    async fn import_embedded_video_audio_to_session_wav_with_progress<F>(
+        src_path: &Path,
+        session_root: &Path,
+        target_sample_rate: u32,
+        mut progress_callback: F,
+    ) -> std::io::Result<(String, usize, usize, ClipPeaks)>
+    where
+        F: FnMut(f32, Option<String>),
+    {
+        Self::ffmpeg_init().map_err(|e| io::Error::other(format!("FFmpeg init failed: {e}")))?;
+        let stem = src_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("audio");
+        let rel = Self::unique_import_rel_path(session_root, "audio", stem, "wav")?;
+        let dst = session_root.join(&rel);
+
+        progress_callback(0.05, Some("Extracting embedded audio".to_string()));
+        tokio::task::yield_now().await;
+
+        let output = Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-i")
+            .arg(src_path)
+            .arg("-vn")
+            .arg("-acodec")
+            .arg("pcm_f32le")
+            .arg("-ar")
+            .arg(target_sample_rate.to_string())
+            .arg("-ac")
+            .arg("2")
+            .arg(&dst)
+            .output()
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "Failed to launch ffmpeg for embedded audio extraction '{}': {e}",
+                    src_path.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "ffmpeg embedded audio extraction failed for '{}': {}",
+                src_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        progress_callback(0.85, Some("Reading".to_string()));
+        tokio::task::yield_now().await;
+        let (channels, frames) = {
+            let wav = Wav::<f32>::from_path(&dst).map_err(|e| {
+                io::Error::other(format!(
+                    "Failed to read extracted WAV '{}': {e}",
+                    dst.display()
+                ))
+            })?;
+            let channels = usize::from(wav.n_channels()).max(1);
+            let frames = wav.n_samples() / channels.max(1);
+            (channels, frames)
+        };
+
+        progress_callback(0.95, Some("Calculating peaks".to_string()));
+        tokio::task::yield_now().await;
+        let peaks = Self::compute_audio_clip_peaks(&dst)?;
+
+        progress_callback(1.0, None);
+        Ok((rel, channels.max(1), frames.max(1), peaks))
+    }
+
+    fn video_stream_info(src_path: &Path, sample_rate: f64) -> io::Result<(bool, usize)> {
+        Self::ffmpeg_init().map_err(|e| io::Error::other(format!("FFmpeg init failed: {e}")))?;
+        let input = ffmpeg_next::format::input(src_path).map_err(|e| {
+            io::Error::other(format!(
+                "Failed to open video '{}': {e}",
+                src_path.display()
+            ))
+        })?;
+        let has_audio = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Audio)
+            .is_some();
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .ok_or_else(|| {
+                io::Error::other(format!("No video stream found in '{}'", src_path.display()))
+            })?;
+        let tb = stream.time_base();
+        let duration = stream.duration().max(0) as f64;
+        let seconds = duration * f64::from(tb.numerator()) / f64::from(tb.denominator().max(1));
+        let length = (seconds * sample_rate.max(1.0)).round() as usize;
+        Ok((has_audio, length.max(1)))
+    }
+
+    fn import_video_to_session(src_path: &Path, session_root: &Path) -> io::Result<String> {
+        let stem = src_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("video");
+        let ext = Self::file_extension_lower(src_path).unwrap_or_else(|| "mp4".to_string());
+        let rel = Self::unique_import_rel_path(session_root, "video", stem, &ext)?;
+        let dst = session_root.join(&rel);
+        fs::create_dir_all(session_root.join("video"))?;
+        fs::copy(src_path, &dst).map_err(|e| {
+            io::Error::other(format!(
+                "Failed to copy video '{}' to '{}': {e}",
+                src_path.display(),
+                dst.display()
+            ))
+        })?;
+        Ok(rel)
     }
 
     async fn stretch_audio_clip_with_rubberband(
@@ -5979,7 +6112,7 @@ mod tests {
     #[test]
     fn referenced_session_media_paths_include_indirect_and_frozen_assets() {
         let mut state = crate::state::StateData::default();
-        let mut track = crate::state::Track::new("Track".to_string(), 0.0, 1, 1, 1, 1);
+        let mut track = crate::state::Track::new("Track".to_string(), 0.0, 1, 1, 1, 1, false);
         let lead_pitch_cache = Maolan::pitch_correction_cache_rel("audio/lead_src.wav", 0, 0);
         let frozen_pitch_cache = Maolan::pitch_correction_cache_rel("audio/frozen_src.wav", 0, 0);
         track.audio.clips.push(crate::state::AudioClip {
@@ -6028,7 +6161,7 @@ mod tests {
     #[test]
     fn referenced_session_media_paths_use_source_offset_and_length_for_pitch_cache_keys() {
         let mut state = crate::state::StateData::default();
-        let mut track = crate::state::Track::new("Track".to_string(), 0.0, 1, 1, 1, 1);
+        let mut track = crate::state::Track::new("Track".to_string(), 0.0, 1, 1, 1, 1, false);
         let expected_cache = Maolan::pitch_correction_cache_rel("audio/source.wav", 128, 4096);
         track.audio.clips.push(crate::state::AudioClip {
             name: "audio/rendered.wav".to_string(),
@@ -6149,7 +6282,7 @@ mod tests {
     fn drain_audio_peak_updates_applies_chunks_and_clears_pending_rebuilds() {
         let _guard = AUDIO_PEAK_TEST_GUARD.lock().expect("lock audio peak test");
         let mut app = Maolan::default();
-        let mut track = crate::state::Track::new("Track".to_string(), 0.0, 1, 1, 0, 0);
+        let mut track = crate::state::Track::new("Track".to_string(), 0.0, 1, 1, 0, 0, false);
         track.audio.clips.push(crate::state::AudioClip {
             name: "audio/import.wav".to_string(),
             start: 0,
@@ -6213,7 +6346,7 @@ mod tests {
     fn drain_audio_peak_updates_accumulates_multiple_chunks() {
         let _guard = AUDIO_PEAK_TEST_GUARD.lock().expect("lock audio peak test");
         let mut app = Maolan::default();
-        let mut track = crate::state::Track::new("Track".to_string(), 0.0, 1, 1, 0, 0);
+        let mut track = crate::state::Track::new("Track".to_string(), 0.0, 1, 1, 0, 0, false);
         track.audio.clips.push(crate::state::AudioClip {
             name: "audio/import.wav".to_string(),
             start: 0,
@@ -6536,7 +6669,7 @@ mod tests {
             export_normalize: true,
             ..Maolan::default()
         };
-        let surround = crate::state::Track::new("Surround".to_string(), 0.0, 1, 4, 0, 0);
+        let surround = crate::state::Track::new("Surround".to_string(), 0.0, 1, 4, 0, 0, false);
         {
             let mut state = app.state.blocking_write();
             state.selected.insert("Surround".to_string());
@@ -6776,7 +6909,7 @@ mod tests {
             recording_preview_start_sample: Some(0),
             ..Maolan::default()
         };
-        let mut track = crate::state::Track::new("Track".to_string(), 0.0, 1, 2, 0, 0);
+        let mut track = crate::state::Track::new("Track".to_string(), 0.0, 1, 2, 0, 0, false);
         track.armed = true;
         track.meter_out_db = vec![-6.0, -90.0];
         app.state.blocking_write().tracks.push(track);

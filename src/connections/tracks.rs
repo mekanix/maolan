@@ -1788,7 +1788,7 @@ mod tests {
 
     #[test]
     fn track_port_kind_for_inputs() {
-        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 1, 2, 1);
+        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 1, 2, 1, false);
         let primary = track.primary_audio_ins();
         // First N ports are primary audio inputs
         if primary > 0 {
@@ -1803,7 +1803,7 @@ mod tests {
 
     #[test]
     fn track_port_kind_for_outputs() {
-        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 1, 2, 1);
+        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 1, 2, 1, false);
         let primary = track.primary_audio_outs();
         // First N ports are primary audio outputs
         if primary > 0 {
@@ -1813,7 +1813,7 @@ mod tests {
 
     #[test]
     fn connection_port_index_for_midi() {
-        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 1, 2, 1);
+        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 1, 2, 1, false);
         // MIDI input port 0 maps after primary audio inputs
         let midi_in_flat = Graph::connection_port_index(&track, Kind::MIDI, 0, true);
         assert!(midi_in_flat >= track.primary_audio_ins());
@@ -1824,7 +1824,7 @@ mod tests {
 
     #[test]
     fn connection_port_index_for_audio() {
-        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 0, 2, 0);
+        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 0, 2, 0, false);
         // Primary audio ports map directly
         assert_eq!(
             Graph::connection_port_index(&track, Kind::Audio, 0, true),
@@ -1838,11 +1838,11 @@ mod tests {
 
     #[test]
     fn track_box_size_adapts_to_port_count() {
-        let track_few = crate::state::Track::new("few".to_string(), 0.0, 1, 0, 1, 0);
+        let track_few = crate::state::Track::new("few".to_string(), 0.0, 1, 0, 1, 0, false);
         let size_few = Graph::track_box_size(&track_few);
         assert!(size_few.height >= 80.0);
 
-        let track_many = crate::state::Track::new("many".to_string(), 0.0, 8, 2, 8, 2);
+        let track_many = crate::state::Track::new("many".to_string(), 0.0, 8, 2, 8, 2, false);
         let size_many = Graph::track_box_size(&track_many);
         assert!(size_many.height > size_few.height);
         assert_eq!(size_many.width, 140.0);
@@ -1850,7 +1850,7 @@ mod tests {
 
     #[test]
     fn track_port_to_engine_index_audio() {
-        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 0, 2, 0);
+        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 0, 2, 0, false);
         let (kind, idx) = Graph::track_port_to_engine_index(&track, 0, true);
         assert_eq!(kind, Kind::Audio);
         assert_eq!(idx, 0);
@@ -1858,7 +1858,7 @@ mod tests {
 
     #[test]
     fn track_port_to_engine_index_midi() {
-        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 1, 2, 1);
+        let track = crate::state::Track::new("test".to_string(), 0.0, 2, 1, 2, 1, false);
         let (kind, idx) = Graph::track_port_to_engine_index(&track, 2, true);
         assert_eq!(kind, Kind::MIDI);
         assert_eq!(idx, 0);
@@ -1885,7 +1885,7 @@ mod tests {
     #[test]
     fn update_clicking_track_body_selects_and_moves_track() {
         let state = Arc::new(RwLock::new(crate::state::StateData::default()));
-        let track = crate::state::Track::new("Track".to_string(), 0.0, 1, 1, 0, 0);
+        let track = crate::state::Track::new("Track".to_string(), 0.0, 1, 1, 0, 0, false);
         let click = Point::new(track.position.x + 5.0, track.position.y + 5.0);
         state.blocking_write().tracks.push(track);
         let graph = Graph::new(state.clone());

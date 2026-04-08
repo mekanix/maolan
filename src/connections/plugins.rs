@@ -1320,6 +1320,7 @@ mod tests {
                 1,
                 0,
                 0,
+                false,
             ));
             data.plugin_graph_track = Some("Track".to_string());
             data.plugin_graph_plugins.push(plugin.clone());
