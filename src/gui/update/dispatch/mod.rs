@@ -7901,11 +7901,11 @@ impl Maolan {
                 }
             }
             Message::OpenExporter => {
-                if self.session_dir.is_none() {
+                let Some(session_root) = self.session_dir.clone() else {
                     self.state.blocking_write().message =
                         "Export requires an opened/saved session".to_string();
                     return Task::none();
-                }
+                };
                 let nearest_rate = crate::consts::gui_mod::STANDARD_EXPORT_SAMPLE_RATES
                     .iter()
                     .min_by_key(|rate| {
@@ -7914,6 +7914,19 @@ impl Maolan {
                     .copied()
                     .unwrap_or(48_000);
                 self.export_sample_rate_hz = nearest_rate;
+                {
+                    let state = self.state.blocking_read();
+                    if let Ok(candidates) =
+                        Self::session_video_export_candidates(&state, &session_root)
+                        && let Some(profile) =
+                            Self::choose_video_export_default_profile(&candidates)
+                    {
+                        self.export_video_frame_rate_input =
+                            Self::format_video_frame_rate(profile.frame_rate);
+                        self.export_video_width = profile.width.max(1);
+                        self.export_video_height = profile.height.max(1);
+                    }
+                }
                 self.normalize_export_hw_out_ports();
                 self.export_format_mp3 =
                     self.export_format_mp3 && self.export_mp3_supported_for_current_settings();
@@ -8018,9 +8031,21 @@ impl Maolan {
                     }
                 }
                 let selected_formats = self.selected_export_formats();
-                if selected_formats.is_empty() {
+                if selected_formats.is_empty() && !self.export_format_video {
                     self.state.blocking_write().message =
                         "Select at least one export format".to_string();
+                    return Task::none();
+                }
+                if self.export_format_video
+                    && !matches!(self.export_render_mode, ExportRenderMode::Mixdown)
+                {
+                    self.state.blocking_write().message =
+                        "Video export currently supports Mixdown only".to_string();
+                    return Task::none();
+                }
+                if self.export_format_video && self.export_hw_out_ports.len() > 2 {
+                    self.state.blocking_write().message =
+                        "Video export currently supports mono or stereo mixdown only".to_string();
                     return Task::none();
                 }
                 if self.export_format_mp3 && !self.export_mp3_supported_for_current_settings() {
@@ -8048,12 +8073,45 @@ impl Maolan {
                         return Task::none();
                     }
                 }
+                if self.export_format_video {
+                    let video_frame_rate = self.export_video_frame_rate_input.parse::<f64>().ok();
+                    let Some(video_frame_rate) = video_frame_rate else {
+                        self.state.blocking_write().message =
+                            "Video FPS must be a number greater than 0".to_string();
+                        return Task::none();
+                    };
+                    if !video_frame_rate.is_finite() || video_frame_rate <= 0.0 {
+                        self.state.blocking_write().message =
+                            "Video FPS must be greater than 0".to_string();
+                        return Task::none();
+                    }
+                    if let Some(session_root) = self.session_dir.clone() {
+                        let candidates_result = {
+                            let state = self.state.blocking_read();
+                            Self::session_video_export_candidates(&state, &session_root)
+                        };
+                        match candidates_result {
+                            Ok(candidates) if candidates.is_empty() => {
+                                self.state.blocking_write().message =
+                                    "Video export requires at least one imported video clip"
+                                        .to_string();
+                                return Task::none();
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                self.state.blocking_write().message =
+                                    format!("Failed to inspect video export clips: {err}");
+                                return Task::none();
+                            }
+                        }
+                    }
+                }
                 self.modal = None;
                 return Task::perform(
                     async move {
                         AsyncFileDialog::new()
-                            .set_title("Export Audio")
-                            .add_filter("Audio", &["wav", "mp3", "ogg", "flac"])
+                            .set_title("Export Media")
+                            .add_filter("Media", &["wav", "mp3", "ogg", "flac", "mkv"])
                             .set_file_name("export")
                             .save_file()
                             .await
@@ -8097,9 +8155,21 @@ impl Maolan {
                     .unwrap_or(-1.0);
                 let export_realtime_fallback = self.export_realtime_fallback;
                 let export_formats = self.selected_export_formats();
-                if export_formats.is_empty() {
+                if export_formats.is_empty() && !self.export_format_video {
                     self.state.blocking_write().message =
                         "Select at least one export format".to_string();
+                    return Task::none();
+                }
+                if self.export_format_video
+                    && !matches!(self.export_render_mode, ExportRenderMode::Mixdown)
+                {
+                    self.state.blocking_write().message =
+                        "Video export currently supports Mixdown only".to_string();
+                    return Task::none();
+                }
+                if self.export_format_video && self.export_hw_out_ports.len() > 2 {
+                    self.state.blocking_write().message =
+                        "Video export currently supports mono or stereo mixdown only".to_string();
                     return Task::none();
                 }
                 if self.export_format_mp3 && !self.export_mp3_supported_for_current_settings() {
@@ -8107,6 +8177,14 @@ impl Maolan {
                         "MP3 export supports only mono or stereo".to_string();
                     return Task::none();
                 }
+                let export_video_enabled = self.export_format_video;
+                let export_video_frame_rate = self
+                    .export_video_frame_rate_input
+                    .parse::<f64>()
+                    .ok()
+                    .unwrap_or(25.0);
+                let export_video_width = self.export_video_width.max(1);
+                let export_video_height = self.export_video_height.max(1);
                 let export_path = Self::export_base_path(path.clone());
                 let export_mp3_mode = self.export_mp3_mode;
                 let export_mp3_bitrate_kbps = self.export_mp3_bitrate_kbps;
@@ -8170,6 +8248,10 @@ impl Maolan {
                                 export_path: export_path.clone(),
                                 sample_rate,
                                 formats: export_formats,
+                                video_enabled: export_video_enabled,
+                                video_frame_rate: export_video_frame_rate,
+                                video_width: export_video_width,
+                                video_height: export_video_height,
                                 render_mode,
                                 selected_hw_out_ports,
                                 realtime_fallback: export_realtime_fallback,

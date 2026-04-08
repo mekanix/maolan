@@ -289,10 +289,14 @@ impl Maolan {
                 "format_mp3": self.export_format_mp3,
                 "format_ogg": self.export_format_ogg,
                 "format_flac": self.export_format_flac,
+                "format_video": self.export_format_video,
                 "bit_depth": Self::export_bit_depth_to_json(self.export_bit_depth),
                 "mp3_mode": Self::export_mp3_mode_to_json(self.export_mp3_mode),
                 "mp3_bitrate_kbps": self.export_mp3_bitrate_kbps,
                 "ogg_quality_input": self.export_ogg_quality_input,
+                "video_frame_rate_input": self.export_video_frame_rate_input,
+                "video_width": self.export_video_width,
+                "video_height": self.export_video_height,
                 "render_mode": Self::export_render_mode_to_json(self.export_render_mode),
                 "hw_out_ports": export_hw_out_ports,
                 "realtime_fallback": self.export_realtime_fallback,
@@ -932,10 +936,14 @@ impl Maolan {
                 "format_mp3": self.export_format_mp3,
                 "format_ogg": self.export_format_ogg,
                 "format_flac": self.export_format_flac,
+                "format_video": self.export_format_video,
                 "bit_depth": Self::export_bit_depth_to_json(self.export_bit_depth),
                 "mp3_mode": Self::export_mp3_mode_to_json(self.export_mp3_mode),
                 "mp3_bitrate_kbps": self.export_mp3_bitrate_kbps,
                 "ogg_quality_input": self.export_ogg_quality_input,
+                "video_frame_rate_input": self.export_video_frame_rate_input,
+                "video_width": self.export_video_width,
+                "video_height": self.export_video_height,
                 "render_mode": Self::export_render_mode_to_json(self.export_render_mode),
                 "hw_out_ports": export_hw_out_ports,
                 "realtime_fallback": self.export_realtime_fallback,
@@ -1120,6 +1128,10 @@ impl Maolan {
                 .get("format_flac")
                 .and_then(Value::as_bool)
                 .unwrap_or(self.export_format_flac);
+            self.export_format_video = export
+                .get("format_video")
+                .and_then(Value::as_bool)
+                .unwrap_or(self.export_format_video);
             self.export_bit_depth = Self::export_bit_depth_from_json(export.get("bit_depth"));
             self.export_mp3_mode = Self::export_mp3_mode_from_json(export.get("mp3_mode"));
             self.export_mp3_bitrate_kbps = export
@@ -1132,6 +1144,21 @@ impl Maolan {
                 .and_then(Value::as_str)
                 .unwrap_or(&self.export_ogg_quality_input)
                 .to_string();
+            self.export_video_frame_rate_input = export
+                .get("video_frame_rate_input")
+                .and_then(Value::as_str)
+                .unwrap_or(&self.export_video_frame_rate_input)
+                .to_string();
+            self.export_video_width = export
+                .get("video_width")
+                .and_then(Value::as_u64)
+                .map(|v| v.clamp(1, u32::MAX as u64) as u32)
+                .unwrap_or(self.export_video_width);
+            self.export_video_height = export
+                .get("video_height")
+                .and_then(Value::as_u64)
+                .map(|v| v.clamp(1, u32::MAX as u64) as u32)
+                .unwrap_or(self.export_video_height);
             self.export_render_mode = Self::export_render_mode_from_json(export.get("render_mode"));
             self.export_hw_out_ports = export
                 .get("hw_out_ports")

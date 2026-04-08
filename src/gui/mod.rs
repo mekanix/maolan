@@ -44,6 +44,7 @@ use ffmpeg_next::{
     frame::{Audio, Video},
     software::scaling::{context::Context as ScalingContext, flag::Flags as ScalingFlags},
     util::format::pixel::Pixel,
+    util::format::sample::{Sample as AudioSample, Type as AudioSampleType},
 };
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
@@ -54,8 +55,11 @@ use iced::{
         text_editor, text_input,
     },
 };
-use maolan_engine::kind::Kind;
-use maolan_engine::message::{Action, Message as EngineMessage};
+use maolan_engine::{
+    kind::Kind,
+    message::{Action, Message as EngineMessage, VideoClipData, VideoFrameBuffer},
+    video::VideoDecoderState,
+};
 use maolan_widgets::numeric_input::{number_input, number_input_f32};
 use midly::{
     Format, Header, MetaMessage, Smf, Timing, TrackEvent, TrackEventKind,
@@ -167,6 +171,10 @@ struct ExportSessionOptions {
     export_path: PathBuf,
     sample_rate: i32,
     formats: Vec<ExportFormat>,
+    video_enabled: bool,
+    video_frame_rate: f64,
+    video_width: u32,
+    video_height: u32,
     render_mode: ExportRenderMode,
     selected_hw_out_ports: Vec<usize>,
     realtime_fallback: bool,
@@ -218,15 +226,47 @@ struct ExportWriteRequest<'a> {
     metadata: &'a ExportMetadata,
 }
 
+struct VideoExportWriteRequest<'a> {
+    export_path: &'a Path,
+    mixed_buffer: &'a [f32],
+    sample_rate: i32,
+    output_channels: usize,
+    metadata: &'a ExportMetadata,
+    session_root: &'a Path,
+    video_tracks: &'a [ExportTrackData],
+    total_length: usize,
+    frame_rate: f64,
+    width: u32,
+    height: u32,
+}
+
 #[derive(Clone)]
 struct ExportTrackData {
     name: String,
+    order: usize,
     level: f32,
     balance: f32,
     muted: bool,
     soloed: bool,
     output_ports: usize,
     clips: Vec<crate::state::AudioClip>,
+    video: Option<crate::state::VideoClip>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VideoExportProfile {
+    frame_rate: f64,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone)]
+struct VideoExportCandidate {
+    path: PathBuf,
+    clip: crate::state::VideoClip,
+    start: usize,
+    order: usize,
+    profile: VideoExportProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -482,10 +522,14 @@ pub struct Maolan {
     export_format_mp3: bool,
     export_format_ogg: bool,
     export_format_flac: bool,
+    export_format_video: bool,
     export_bit_depth: ExportBitDepth,
     export_mp3_mode: ExportMp3Mode,
     export_mp3_bitrate_kbps: u16,
     export_ogg_quality_input: String,
+    export_video_frame_rate_input: String,
+    export_video_width: u32,
+    export_video_height: u32,
     export_render_mode: ExportRenderMode,
     export_hw_out_ports: BTreeSet<usize>,
     export_realtime_fallback: bool,
@@ -744,10 +788,14 @@ impl Default for Maolan {
             export_format_mp3: false,
             export_format_ogg: false,
             export_format_flac: false,
+            export_format_video: false,
             export_bit_depth: ExportBitDepth::Int24,
             export_mp3_mode: ExportMp3Mode::Cbr,
             export_mp3_bitrate_kbps: 320,
             export_ogg_quality_input: "0.6".to_string(),
+            export_video_frame_rate_input: "25".to_string(),
+            export_video_width: 1280,
+            export_video_height: 720,
             export_render_mode: ExportRenderMode::Mixdown,
             export_hw_out_ports: [0_usize, 1].into_iter().collect(),
             export_realtime_fallback: false,
@@ -3707,6 +3755,414 @@ impl Maolan {
         }
     }
 
+    fn video_export_frame_rate_rational(frame_rate: f64) -> ffmpeg_next::Rational {
+        let scaled = (frame_rate.max(1.0) * 1000.0).round() as i32;
+        let denom = 1000_i32;
+        fn gcd(mut a: i32, mut b: i32) -> i32 {
+            while b != 0 {
+                let r = a % b;
+                a = b;
+                b = r;
+            }
+            a.abs().max(1)
+        }
+        let divisor = gcd(scaled, denom);
+        ffmpeg_next::Rational(scaled / divisor, denom / divisor)
+    }
+
+    fn copy_rgba_buffer_to_frame(
+        frame: &mut Video,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> io::Result<()> {
+        let required = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if rgba.len() < required {
+            return Err(io::Error::other("RGBA buffer is smaller than target frame"));
+        }
+        let stride = frame.stride(0);
+        let row_bytes = width as usize * 4;
+        let data = frame.data_mut(0);
+        for y in 0..height as usize {
+            let src_start = y * row_bytes;
+            let src_end = src_start + row_bytes;
+            let dst_start = y * stride;
+            let dst_end = dst_start + row_bytes;
+            data[dst_start..dst_end].copy_from_slice(&rgba[src_start..src_end]);
+        }
+        Ok(())
+    }
+
+    fn composite_video_frame(
+        canvas: &mut [u8],
+        canvas_width: u32,
+        canvas_height: u32,
+        source: &VideoFrameBuffer,
+    ) {
+        canvas.fill(0);
+        if source.width == 0 || source.height == 0 || source.rgba.is_empty() {
+            return;
+        }
+
+        let scale = f64::min(
+            canvas_width as f64 / source.width as f64,
+            canvas_height as f64 / source.height as f64,
+        )
+        .max(0.0);
+        let draw_width =
+            ((source.width as f64 * scale).round() as u32).clamp(1, canvas_width.max(1));
+        let draw_height =
+            ((source.height as f64 * scale).round() as u32).clamp(1, canvas_height.max(1));
+        let offset_x = ((canvas_width.saturating_sub(draw_width)) / 2) as usize;
+        let offset_y = ((canvas_height.saturating_sub(draw_height)) / 2) as usize;
+        let src_stride = source.width as usize * 4;
+        let dst_stride = canvas_width as usize * 4;
+
+        for y in 0..draw_height as usize {
+            let src_y = ((y as f64 * source.height as f64) / draw_height as f64)
+                .floor()
+                .clamp(0.0, source.height.saturating_sub(1) as f64)
+                as usize;
+            for x in 0..draw_width as usize {
+                let src_x = ((x as f64 * source.width as f64) / draw_width as f64)
+                    .floor()
+                    .clamp(0.0, source.width.saturating_sub(1) as f64)
+                    as usize;
+                let src_index = src_y * src_stride + src_x * 4;
+                let dst_index = (offset_y + y) * dst_stride + (offset_x + x) * 4;
+                canvas[dst_index..dst_index + 4]
+                    .copy_from_slice(&source.rgba[src_index..src_index + 4]);
+            }
+        }
+    }
+
+    fn write_video_export_mkv<F>(
+        req: VideoExportWriteRequest<'_>,
+        mut progress_callback: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(f32, Option<String>),
+    {
+        if req.output_channels != 1 && req.output_channels != 2 {
+            return Err(io::Error::other(
+                "Video export currently supports mono or stereo audio only",
+            ));
+        }
+
+        Self::ffmpeg_init().map_err(|e| io::Error::other(format!("FFmpeg init failed: {e}")))?;
+
+        let mut candidates = Vec::new();
+        for track in req.video_tracks {
+            let Some(video) = track.video.clone() else {
+                continue;
+            };
+            let path = Self::resolve_session_media_path(req.session_root, &video.path);
+            let profile = Self::probe_video_export_profile(&path)?;
+            candidates.push(VideoExportCandidate {
+                path,
+                start: video.start,
+                clip: video,
+                order: track.order,
+                profile,
+            });
+        }
+
+        let mut octx = output(req.export_path.to_str().unwrap_or("export.mkv"))
+            .map_err(|e| io::Error::other(format!("Failed to create output context: {e}")))?;
+
+        let frame_rate = req.frame_rate.max(1.0);
+        let frame_rate_rational = Self::video_export_frame_rate_rational(frame_rate);
+        let frame_time_base = ffmpeg_next::Rational(
+            frame_rate_rational.denominator().max(1),
+            frame_rate_rational.numerator().max(1),
+        );
+
+        let video_codec = ffmpeg_next::codec::encoder::find(CodecId::MPEG4)
+            .ok_or_else(|| io::Error::other("MPEG-4 video encoder not found"))?;
+        let mut video_encoder = CodecContext::new_with_codec(video_codec)
+            .encoder()
+            .video()
+            .map_err(|e| io::Error::other(format!("Failed to create video encoder: {e}")))?;
+        video_encoder.set_width(req.width.max(1));
+        video_encoder.set_height(req.height.max(1));
+        video_encoder.set_format(Pixel::YUV420P);
+        video_encoder.set_time_base(frame_time_base);
+        video_encoder.set_frame_rate(Some(frame_rate_rational));
+        video_encoder.set_gop(frame_rate.round().max(1.0) as u32);
+        video_encoder.set_max_b_frames(2);
+        video_encoder.set_bit_rate(
+            (((req.width as f64) * (req.height as f64) * frame_rate * 2.0).round() as usize)
+                .clamp(2_000_000, 20_000_000),
+        );
+
+        let audio_codec = ffmpeg_next::codec::encoder::find(CodecId::PCM_S16LE)
+            .ok_or_else(|| io::Error::other("PCM S16LE encoder not found"))?;
+        let mut audio_encoder = CodecContext::new_with_codec(audio_codec)
+            .encoder()
+            .audio()
+            .map_err(|e| io::Error::other(format!("Failed to create audio encoder: {e}")))?;
+        audio_encoder.set_rate(req.sample_rate.max(1));
+        audio_encoder.set_format(AudioSample::I16(AudioSampleType::Packed));
+        audio_encoder.set_channel_layout(match req.output_channels {
+            1 => ffmpeg_next::channel_layout::ChannelLayout::MONO,
+            _ => ffmpeg_next::channel_layout::ChannelLayout::STEREO,
+        });
+        audio_encoder.set_time_base(ffmpeg_next::Rational(1, req.sample_rate.max(1)));
+        audio_encoder.set_bit_rate(req.sample_rate.max(1) as usize * req.output_channels * 16);
+
+        let video_stream_index = {
+            let mut stream = octx
+                .add_stream(video_codec)
+                .map_err(|e| io::Error::other(format!("Failed to add video stream: {e}")))?;
+            stream.set_time_base(frame_time_base);
+            stream.set_rate(frame_rate_rational);
+            stream.set_avg_frame_rate(frame_rate_rational);
+            stream.set_parameters(&video_encoder);
+            stream.index()
+        };
+        let audio_stream_index = {
+            let mut stream = octx
+                .add_stream(audio_codec)
+                .map_err(|e| io::Error::other(format!("Failed to add audio stream: {e}")))?;
+            stream.set_time_base(ffmpeg_next::Rational(1, req.sample_rate.max(1)));
+            stream.set_parameters(&audio_encoder);
+            stream.index()
+        };
+
+        let mut metadata_dict = Dictionary::new();
+        if !req.metadata.author.is_empty() {
+            metadata_dict.set("artist", &req.metadata.author);
+        }
+        if !req.metadata.album.is_empty() {
+            metadata_dict.set("album", &req.metadata.album);
+        }
+        if let Some(year) = req.metadata.year {
+            metadata_dict.set("date", &year.to_string());
+        }
+        if let Some(track_number) = req.metadata.track_number {
+            metadata_dict.set("track", &track_number.to_string());
+        }
+        if !req.metadata.genre.is_empty() {
+            metadata_dict.set("genre", &req.metadata.genre);
+        }
+        octx.set_metadata(metadata_dict);
+
+        let mut video_encoder = video_encoder
+            .open_as(video_codec)
+            .map_err(|e| io::Error::other(format!("Failed to open video encoder: {e}")))?;
+        let mut audio_encoder = audio_encoder
+            .open_as(audio_codec)
+            .map_err(|e| io::Error::other(format!("Failed to open audio encoder: {e}")))?;
+
+        if let Some(mut stream) = octx.stream_mut(video_stream_index) {
+            stream.set_time_base(frame_time_base);
+            stream.set_rate(frame_rate_rational);
+            stream.set_avg_frame_rate(frame_rate_rational);
+            stream.set_parameters(&video_encoder);
+        }
+        if let Some(mut stream) = octx.stream_mut(audio_stream_index) {
+            stream.set_time_base(ffmpeg_next::Rational(1, req.sample_rate.max(1)));
+            stream.set_parameters(&audio_encoder);
+        }
+
+        octx.write_header()
+            .map_err(|e| io::Error::other(format!("Failed to write MKV header: {e}")))?;
+
+        let output_video_time_base = octx
+            .stream(video_stream_index)
+            .map(|stream| stream.time_base())
+            .unwrap_or(frame_time_base);
+        let output_audio_time_base = octx
+            .stream(audio_stream_index)
+            .map(|stream| stream.time_base())
+            .unwrap_or(ffmpeg_next::Rational(1, req.sample_rate.max(1)));
+
+        let mut rgba_frame = Video::new(Pixel::RGBA, req.width.max(1), req.height.max(1));
+        let mut yuv_frame = Video::new(Pixel::YUV420P, req.width.max(1), req.height.max(1));
+        let mut video_scaler = ScalingContext::get(
+            Pixel::RGBA,
+            req.width.max(1),
+            req.height.max(1),
+            Pixel::YUV420P,
+            req.width.max(1),
+            req.height.max(1),
+            ScalingFlags::BILINEAR,
+        )
+        .map_err(|e| io::Error::other(format!("Failed to create video scaler: {e}")))?;
+        let mut canvas = vec![0_u8; (req.width.max(1) as usize) * (req.height.max(1) as usize) * 4];
+        let mut decoders: HashMap<String, VideoDecoderState> = HashMap::new();
+        let total_frames = ((req.total_length as f64 / req.sample_rate.max(1) as f64) * frame_rate)
+            .ceil()
+            .max(1.0) as usize;
+
+        for frame_idx in 0..total_frames {
+            let progress = frame_idx as f32 / total_frames.max(1) as f32;
+            progress_callback(
+                progress.clamp(0.0, 0.94),
+                Some(format!(
+                    "Rendering video frame {}/{}",
+                    frame_idx + 1,
+                    total_frames
+                )),
+            );
+
+            let sample =
+                ((frame_idx as f64 / frame_rate) * req.sample_rate.max(1) as f64).round() as usize;
+            if let Some(candidate) = candidates.iter().rev().find(|candidate| {
+                sample >= candidate.clip.start
+                    && sample < candidate.clip.start.saturating_add(candidate.clip.length)
+            }) {
+                let key = candidate.path.to_string_lossy().to_string();
+                if !decoders.contains_key(&key) {
+                    decoders.insert(
+                        key.clone(),
+                        VideoDecoderState::new(
+                            VideoClipData {
+                                path: key.clone(),
+                                start: candidate.clip.start,
+                                length: candidate.clip.length,
+                                offset: candidate.clip.offset,
+                            },
+                            req.sample_rate.max(1) as f64,
+                        )
+                        .map_err(io::Error::other)?,
+                    );
+                }
+                let frame = decoders
+                    .get_mut(&key)
+                    .expect("decoder inserted above")
+                    .decode_frame_at_sample(sample)
+                    .map_err(io::Error::other)?;
+                let frame = frame.lock().clone();
+                Self::composite_video_frame(
+                    &mut canvas,
+                    req.width.max(1),
+                    req.height.max(1),
+                    &frame,
+                );
+            } else {
+                canvas.fill(0);
+            }
+
+            Self::copy_rgba_buffer_to_frame(
+                &mut rgba_frame,
+                &canvas,
+                req.width.max(1),
+                req.height.max(1),
+            )?;
+            video_scaler
+                .run(&rgba_frame, &mut yuv_frame)
+                .map_err(|e| io::Error::other(format!("Failed to scale video frame: {e}")))?;
+            yuv_frame.set_pts(Some(frame_idx as i64));
+
+            video_encoder
+                .send_frame(&yuv_frame)
+                .map_err(|e| io::Error::other(format!("Failed to send video frame: {e}")))?;
+            let mut packet = ffmpeg_next::packet::Packet::empty();
+            while video_encoder.receive_packet(&mut packet).is_ok() {
+                packet.set_stream(video_stream_index);
+                packet.rescale_ts(frame_time_base, output_video_time_base);
+                packet
+                    .write_interleaved(&mut octx)
+                    .map_err(|e| io::Error::other(format!("Failed to write video packet: {e}")))?;
+            }
+        }
+
+        video_encoder
+            .send_eof()
+            .map_err(|e| io::Error::other(format!("Failed to flush video encoder: {e}")))?;
+        let mut packet = ffmpeg_next::packet::Packet::empty();
+        while video_encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(video_stream_index);
+            packet.rescale_ts(frame_time_base, output_video_time_base);
+            packet
+                .write_interleaved(&mut octx)
+                .map_err(|e| io::Error::other(format!("Failed to write video packet: {e}")))?;
+        }
+
+        let audio_frame_size = 2048usize;
+        for (chunk_index, chunk_start) in (0..req.mixed_buffer.len())
+            .step_by(audio_frame_size * req.output_channels)
+            .enumerate()
+        {
+            let chunk_end =
+                (chunk_start + audio_frame_size * req.output_channels).min(req.mixed_buffer.len());
+            let chunk = &req.mixed_buffer[chunk_start..chunk_end];
+            let actual_frames = chunk.len() / req.output_channels;
+            if actual_frames == 0 {
+                continue;
+            }
+
+            progress_callback(
+                (0.94
+                    + (chunk_index as f32
+                        / (req.mixed_buffer.len() / req.output_channels.max(1)).max(1) as f32)
+                        * 0.05)
+                    .clamp(0.94, 0.99),
+                Some("Encoding video audio".to_string()),
+            );
+
+            let mut frame = Audio::empty();
+            frame.set_format(audio_encoder.format());
+            frame.set_channel_layout(audio_encoder.channel_layout());
+            frame.set_rate(audio_encoder.rate());
+            frame.set_samples(actual_frames);
+            frame.set_pts(Some((chunk_start / req.output_channels) as i64));
+
+            unsafe {
+                ffmpeg_next::ffi::av_frame_get_buffer(frame.as_mut_ptr(), 0);
+            }
+
+            let data = frame.data_mut(0);
+            for frame_idx in 0..actual_frames {
+                for ch in 0..req.output_channels {
+                    let sample = chunk[frame_idx * req.output_channels + ch].clamp(-1.0, 1.0)
+                        * i16::MAX as f32;
+                    let value = sample.round() as i16;
+                    let bytes = value.to_ne_bytes();
+                    let dst = (frame_idx * req.output_channels + ch) * 2;
+                    data[dst..dst + 2].copy_from_slice(&bytes);
+                }
+            }
+
+            audio_encoder
+                .send_frame(&frame)
+                .map_err(|e| io::Error::other(format!("Failed to send audio frame: {e}")))?;
+            let mut packet = ffmpeg_next::packet::Packet::empty();
+            while audio_encoder.receive_packet(&mut packet).is_ok() {
+                packet.set_stream(audio_stream_index);
+                packet.rescale_ts(
+                    ffmpeg_next::Rational(1, req.sample_rate.max(1)),
+                    output_audio_time_base,
+                );
+                packet
+                    .write_interleaved(&mut octx)
+                    .map_err(|e| io::Error::other(format!("Failed to write audio packet: {e}")))?;
+            }
+        }
+
+        audio_encoder
+            .send_eof()
+            .map_err(|e| io::Error::other(format!("Failed to flush audio encoder: {e}")))?;
+        let mut packet = ffmpeg_next::packet::Packet::empty();
+        while audio_encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(audio_stream_index);
+            packet.rescale_ts(
+                ffmpeg_next::Rational(1, req.sample_rate.max(1)),
+                output_audio_time_base,
+            );
+            packet
+                .write_interleaved(&mut octx)
+                .map_err(|e| io::Error::other(format!("Failed to write audio packet: {e}")))?;
+        }
+
+        octx.write_trailer()
+            .map_err(|e| io::Error::other(format!("Failed to finalize video export: {e}")))?;
+        Ok(())
+    }
+
     fn measure_lufs_and_true_peak(
         samples: &[f32],
         channels: usize,
@@ -3936,6 +4392,10 @@ impl Maolan {
         let export_path = options.export_path.as_path();
         let sample_rate = options.sample_rate;
         let export_formats = options.formats.clone();
+        let video_enabled = options.video_enabled;
+        let video_frame_rate = options.video_frame_rate;
+        let video_width = options.video_width;
+        let video_height = options.video_height;
         let bit_depth = options.bit_depth;
         let mp3_mode = options.mp3_mode;
         let mp3_bitrate_kbps = options.mp3_bitrate_kbps;
@@ -3980,21 +4440,27 @@ impl Maolan {
             let tracks_data: Vec<_> = state
                 .tracks
                 .iter()
-                .map(|track| {
+                .enumerate()
+                .map(|(order, track)| {
                     let mut track_max = 0_usize;
                     for clip in &track.audio.clips {
                         let clip_end = clip.start + clip.length;
                         track_max = track_max.max(clip_end);
                     }
+                    if let Some(video) = &track.video {
+                        track_max = track_max.max(video.start + video.length);
+                    }
                     max_length = max_length.max(track_max);
                     ExportTrackData {
                         name: track.name.clone(),
+                        order,
                         level: track.level,
                         balance: track.balance,
                         muted: track.muted,
                         soloed: track.soloed,
                         output_ports: track.audio.outs.max(1),
                         clips: track.audio.clips.clone(),
+                        video: track.video.clone(),
                     }
                 })
                 .collect();
@@ -4059,10 +4525,10 @@ impl Maolan {
 
         if total_length == 0 {
             return Err(io::Error::other(
-                "No audio clips found. Nothing to export.".to_string(),
+                "No audio or video clips found. Nothing to export.".to_string(),
             ));
         }
-        if export_formats.is_empty() {
+        if export_formats.is_empty() && !video_enabled {
             return Err(io::Error::other("Select at least one export format"));
         }
 
@@ -4179,7 +4645,8 @@ impl Maolan {
                 }
             }
             let base_path = Self::export_base_path(export_path.to_path_buf());
-            let write_span = 0.1 / export_formats.len().max(1) as f32;
+            let output_count = export_formats.len() + usize::from(video_enabled);
+            let write_span = 0.1 / output_count.max(1) as f32;
             for (format_idx, format) in export_formats.iter().enumerate() {
                 let write_progress = 0.9 + write_span * format_idx as f32;
                 progress_callback(
@@ -4198,6 +4665,37 @@ impl Maolan {
                     codec,
                     metadata: &metadata,
                 })?;
+            }
+            if video_enabled {
+                let write_progress = 0.9 + write_span * export_formats.len() as f32;
+                progress_callback(
+                    write_progress.clamp(0.0, 0.99),
+                    Some(format!(
+                        "Writing video {}x{} @ {} fps",
+                        video_width, video_height, video_frame_rate
+                    )),
+                );
+                tokio::task::yield_now().await;
+                let out_path = base_path.with_extension("mkv");
+                Self::write_video_export_mkv(
+                    VideoExportWriteRequest {
+                        export_path: &out_path,
+                        mixed_buffer: &mixed_buffer,
+                        sample_rate,
+                        output_channels,
+                        metadata: &metadata,
+                        session_root,
+                        video_tracks: &tracks,
+                        total_length,
+                        frame_rate: video_frame_rate,
+                        width: video_width,
+                        height: video_height,
+                    },
+                    |progress, operation| {
+                        let scaled = write_progress + progress.clamp(0.0, 1.0) * write_span;
+                        progress_callback(scaled.clamp(0.0, 0.99), operation);
+                    },
+                )?;
             }
             progress_callback(1.0, Some("Complete".to_string()));
             return Ok(());
@@ -5381,6 +5879,120 @@ impl Maolan {
         formats
     }
 
+    fn resolve_session_media_path(session_root: &Path, path: &str) -> PathBuf {
+        let clip_path = PathBuf::from(path);
+        if clip_path.is_absolute() {
+            clip_path
+        } else {
+            session_root.join(clip_path)
+        }
+    }
+
+    fn probe_video_export_profile(path: &Path) -> io::Result<VideoExportProfile> {
+        Self::ffmpeg_init().map_err(|e| io::Error::other(format!("FFmpeg init failed: {e}")))?;
+        let input = ffmpeg_next::format::input(path).map_err(|e| {
+            io::Error::other(format!("Failed to open video '{}': {e}", path.display()))
+        })?;
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .ok_or_else(|| {
+                io::Error::other(format!("No video stream found in '{}'", path.display()))
+            })?;
+        let context = CodecContext::from_parameters(stream.parameters())
+            .map_err(|e| io::Error::other(format!("Video codec params failed: {e}")))?;
+        let decoder = context
+            .decoder()
+            .video()
+            .map_err(|e| io::Error::other(format!("Video decoder open failed: {e}")))?;
+        let rate = {
+            let avg = stream.avg_frame_rate();
+            if avg.numerator() > 0 && avg.denominator() > 0 {
+                avg
+            } else {
+                let nominal = stream.rate();
+                if nominal.numerator() > 0 && nominal.denominator() > 0 {
+                    nominal
+                } else {
+                    ffmpeg_next::Rational(25, 1)
+                }
+            }
+        };
+        let frame_rate = f64::from(rate.numerator().max(1)) / f64::from(rate.denominator().max(1));
+        Ok(VideoExportProfile {
+            frame_rate: frame_rate.max(1.0),
+            width: decoder.width().max(1),
+            height: decoder.height().max(1),
+        })
+    }
+
+    fn choose_video_export_default_profile(
+        candidates: &[VideoExportCandidate],
+    ) -> Option<VideoExportProfile> {
+        candidates
+            .iter()
+            .min_by(|left, right| {
+                left.start
+                    .cmp(&right.start)
+                    .then_with(|| {
+                        right
+                            .profile
+                            .frame_rate
+                            .partial_cmp(&left.profile.frame_rate)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| {
+                        let left_area =
+                            u64::from(left.profile.width) * u64::from(left.profile.height);
+                        let right_area =
+                            u64::from(right.profile.width) * u64::from(right.profile.height);
+                        right_area.cmp(&left_area)
+                    })
+                    .then_with(|| right.profile.width.cmp(&left.profile.width))
+                    .then_with(|| right.profile.height.cmp(&left.profile.height))
+                    .then_with(|| left.order.cmp(&right.order))
+            })
+            .map(|candidate| candidate.profile)
+    }
+
+    fn session_video_export_candidates(
+        state: &crate::state::StateData,
+        session_root: &Path,
+    ) -> io::Result<Vec<VideoExportCandidate>> {
+        let mut candidates = Vec::new();
+        for (order, track) in state.tracks.iter().enumerate() {
+            let Some(video) = track.video.clone() else {
+                continue;
+            };
+            let path = Self::resolve_session_media_path(session_root, &video.path);
+            let profile = Self::probe_video_export_profile(&path)?;
+            candidates.push(VideoExportCandidate {
+                path,
+                start: video.start,
+                clip: video,
+                order,
+                profile,
+            });
+        }
+        Ok(candidates)
+    }
+
+    fn format_video_frame_rate(frame_rate: f64) -> String {
+        let rounded = frame_rate.round();
+        if (frame_rate - rounded).abs() < 0.0005 {
+            format!("{}", rounded as u32)
+        } else {
+            let mut text = format!("{frame_rate:.3}");
+            while text.contains('.') && text.ends_with('0') {
+                text.pop();
+            }
+            if text.ends_with('.') {
+                text.pop();
+            }
+            text
+        }
+    }
+
     fn export_bit_depth_options(formats: &[ExportFormat]) -> Vec<ExportBitDepth> {
         if formats
             .iter()
@@ -5406,7 +6018,7 @@ impl Maolan {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
-            .is_some_and(|e| matches!(e.as_str(), "wav" | "mp3" | "ogg" | "flac"));
+            .is_some_and(|e| matches!(e.as_str(), "wav" | "mp3" | "ogg" | "flac" | "mkv"));
         if known_ext {
             path.with_extension("")
         } else {
@@ -5478,9 +6090,36 @@ impl Maolan {
                             checkbox(self.export_format_flac)
                                 .label("FLAC")
                                 .on_toggle(Message::ExportFormatFlacToggled),
+                            checkbox(self.export_format_video)
+                                .label("Video (MKV)")
+                                .on_toggle(Message::ExportFormatVideoToggled),
                         ]
                         .spacing(10)
                         .align_y(iced::Alignment::Center),
+                        if self.export_format_video {
+                            row![
+                                text("Video FPS:"),
+                                text_input("25", &self.export_video_frame_rate_input)
+                                    .on_input(Message::ExportVideoFrameRateInput)
+                                    .width(Length::Fixed(100.0)),
+                                text("Resolution:"),
+                                number_input(
+                                    &self.export_video_width,
+                                    1..=8192,
+                                    Message::ExportVideoWidthChanged
+                                ),
+                                text("x"),
+                                number_input(
+                                    &self.export_video_height,
+                                    1..=8192,
+                                    Message::ExportVideoHeightChanged
+                                ),
+                            ]
+                            .spacing(10)
+                            .align_y(iced::Alignment::Center)
+                        } else {
+                            row![text("")].spacing(10).align_y(iced::Alignment::Center)
+                        },
                         row![
                             text("Sample rate (Hz):"),
                             pick_list(
@@ -7603,6 +8242,99 @@ mod tests {
         let path = PathBuf::from("/tmp/session/test.wav");
         let base = Maolan::export_base_path(path);
         assert_eq!(base, PathBuf::from("/tmp/session/test"));
+    }
+
+    #[test]
+    fn choose_video_export_default_profile_prefers_earliest_clip() {
+        let candidates = vec![
+            VideoExportCandidate {
+                path: PathBuf::from("/tmp/a.mkv"),
+                clip: crate::state::VideoClip {
+                    path: "video/a.mkv".to_string(),
+                    start: 1024,
+                    length: 100,
+                    offset: 0,
+                    frame_interval_samples: 1,
+                    frame: None,
+                    current_frame: None,
+                },
+                start: 1024,
+                order: 0,
+                profile: VideoExportProfile {
+                    frame_rate: 24.0,
+                    width: 1280,
+                    height: 720,
+                },
+            },
+            VideoExportCandidate {
+                path: PathBuf::from("/tmp/b.mkv"),
+                clip: crate::state::VideoClip {
+                    path: "video/b.mkv".to_string(),
+                    start: 512,
+                    length: 100,
+                    offset: 0,
+                    frame_interval_samples: 1,
+                    frame: None,
+                    current_frame: None,
+                },
+                start: 512,
+                order: 1,
+                profile: VideoExportProfile {
+                    frame_rate: 30.0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+        ];
+
+        let profile = Maolan::choose_video_export_default_profile(&candidates).expect("profile");
+        assert_eq!(profile.frame_rate, 30.0);
+        assert_eq!(profile.width, 1920);
+        assert_eq!(profile.height, 1080);
+    }
+
+    #[test]
+    fn choose_video_export_default_profile_breaks_ties_by_fps_then_resolution() {
+        let candidates = vec![
+            VideoExportCandidate {
+                path: PathBuf::from("/tmp/a.mkv"),
+                clip: crate::state::VideoClip::default(),
+                start: 0,
+                order: 0,
+                profile: VideoExportProfile {
+                    frame_rate: 24.0,
+                    width: 3840,
+                    height: 2160,
+                },
+            },
+            VideoExportCandidate {
+                path: PathBuf::from("/tmp/b.mkv"),
+                clip: crate::state::VideoClip::default(),
+                start: 0,
+                order: 1,
+                profile: VideoExportProfile {
+                    frame_rate: 30.0,
+                    width: 1280,
+                    height: 720,
+                },
+            },
+            VideoExportCandidate {
+                path: PathBuf::from("/tmp/c.mkv"),
+                clip: crate::state::VideoClip::default(),
+                start: 0,
+                order: 2,
+                profile: VideoExportProfile {
+                    frame_rate: 30.0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+        ];
+
+        let profile = Maolan::choose_video_export_default_profile(&candidates).expect("profile");
+        assert_eq!(profile.frame_rate, 30.0);
+        assert_eq!(profile.width, 1920);
+        assert_eq!(profile.height, 1080);
     }
 
     #[test]

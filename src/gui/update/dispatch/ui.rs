@@ -51,6 +51,10 @@ impl Maolan {
                 self.adjust_export_bit_depth_if_needed();
                 true
             }
+            Message::ExportFormatVideoToggled(enabled) => {
+                self.export_format_video = *enabled;
+                true
+            }
             Message::ExportMp3ModeSelected(mode) => {
                 self.export_mp3_mode = *mode;
                 true
@@ -64,6 +68,21 @@ impl Maolan {
                     .chars()
                     .filter(|c| c.is_ascii_digit() || *c == '-' || *c == '.')
                     .collect();
+                true
+            }
+            Message::ExportVideoFrameRateInput(input) => {
+                self.export_video_frame_rate_input = input
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                true
+            }
+            Message::ExportVideoWidthChanged(width) => {
+                self.export_video_width = (*width).max(1);
+                true
+            }
+            Message::ExportVideoHeightChanged(height) => {
+                self.export_video_height = (*height).max(1);
                 true
             }
             Message::ExportBitDepthSelected(bit_depth) => {
