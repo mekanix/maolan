@@ -279,7 +279,8 @@ impl Maolan {
                 "tracks_width": tracks_width,
                 "mixer_height": mixer_height,
                 "video_preview_height": video_preview_height,
-                "video_preview_split": state.video_preview_split,
+                "video_preview_left_width": state.video_preview_left_width,
+                "video_preview_middle_width": state.video_preview_middle_width,
                 "zoom_visible_bars": self.zoom_visible_bars,
             },
             "export": {
@@ -921,7 +922,8 @@ impl Maolan {
                 "tracks_width": tracks_width,
                 "mixer_height": mixer_height,
                 "video_preview_height": video_preview_height,
-                "video_preview_split": state.video_preview_split,
+                "video_preview_left_width": state.video_preview_left_width,
+                "video_preview_middle_width": state.video_preview_middle_width,
                 "zoom_visible_bars": self.zoom_visible_bars,
             },
             "export": {
@@ -1418,9 +1420,12 @@ impl Maolan {
                     .as_f64()
                     .unwrap_or(280.0) as f32,
             );
-            state.video_preview_split =
-                (session["ui"]["video_preview_split"].as_f64().unwrap_or(0.5) as f32)
-                    .clamp(0.2, 0.8);
+            state.video_preview_left_width = session["ui"]["video_preview_left_width"]
+                .as_f64()
+                .unwrap_or(420.0) as f32;
+            state.video_preview_middle_width = session["ui"]["video_preview_middle_width"]
+                .as_f64()
+                .unwrap_or(360.0) as f32;
         }
         self.zoom_visible_bars = session["ui"]["zoom_visible_bars"]
             .as_f64()

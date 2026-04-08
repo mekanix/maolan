@@ -726,6 +726,7 @@ pub enum Message {
     MixerResizeStart,
     VideoPreviewResizeStart,
     VideoPreviewSplitResizeStart,
+    VideoPreviewSplitSecondaryResizeStart,
     MixerLevelEditStart(String),
     MixerLevelEditInput(String),
     MixerLevelEditCommit,
@@ -791,6 +792,7 @@ pub enum Message {
     MixerResizeHover(bool),
     VideoPreviewResizeHover(bool),
     VideoPreviewSplitResizeHover(bool),
+    VideoPreviewSplitSecondaryResizeHover(bool),
 
     OpenFileImporter,
     DeleteUnusedSessionMediaFiles,

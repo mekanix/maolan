@@ -2051,6 +2051,9 @@ impl Maolan {
             Message::VideoPreviewSplitResizeHover(hovered) => {
                 self.video_preview_split_resize_hovered = hovered;
             }
+            Message::VideoPreviewSplitSecondaryResizeHover(hovered) => {
+                self.video_preview_split_secondary_resize_hovered = hovered;
+            }
             Message::TransportRecordToggle => {
                 self.toolbar.update(&message);
                 if self.record_armed {
@@ -5419,10 +5422,20 @@ impl Maolan {
             Message::VideoPreviewSplitResizeStart => {
                 let (initial_split, initial_mouse_x) = {
                     let state = self.state.blocking_read();
-                    (state.video_preview_split, state.cursor.x)
+                    (state.video_preview_left_width, state.cursor.x)
                 };
                 self.state.blocking_write().resizing =
                     Some(Resizing::VideoPreviewSplit(initial_split, initial_mouse_x));
+            }
+            Message::VideoPreviewSplitSecondaryResizeStart => {
+                let (initial_split, initial_mouse_x) = {
+                    let state = self.state.blocking_read();
+                    (state.video_preview_middle_width, state.cursor.x)
+                };
+                self.state.blocking_write().resizing = Some(Resizing::VideoPreviewSplitSecondary(
+                    initial_split,
+                    initial_mouse_x,
+                ));
             }
             Message::MixerLevelEditStart(ref track_name) => {
                 let level = {
@@ -5831,9 +5844,21 @@ impl Maolan {
                             Length::Fixed((initial_height + delta).clamp(120.0, 720.0));
                     }
                     Some(Resizing::VideoPreviewSplit(initial_split, initial_mouse_x)) => {
-                        let delta = (position.x - initial_mouse_x) / self.size.width.max(1.0);
-                        self.state.blocking_write().video_preview_split =
-                            (initial_split + delta).clamp(0.2, 0.8);
+                        let delta = position.x - initial_mouse_x;
+                        let mut state = self.state.blocking_write();
+                        let total = self.size.width.max(1.0) - 38.0;
+                        let max_left =
+                            (total - state.video_preview_middle_width - 160.0).max(160.0);
+                        state.video_preview_left_width =
+                            (initial_split + delta).clamp(160.0, max_left);
+                    }
+                    Some(Resizing::VideoPreviewSplitSecondary(initial_split, initial_mouse_x)) => {
+                        let delta = position.x - initial_mouse_x;
+                        let mut state = self.state.blocking_write();
+                        let total = self.size.width.max(1.0) - 41.0;
+                        let available = (total - state.video_preview_left_width - 160.0).max(160.0);
+                        state.video_preview_middle_width =
+                            (initial_split + delta).clamp(160.0, available);
                     }
                     Some(Resizing::Fade {
                         kind,
