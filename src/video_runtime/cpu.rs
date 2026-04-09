@@ -15,7 +15,7 @@ use crate::{
     state::VideoClip,
     video_runtime::{
         backend::VideoBackend,
-        types::{VideoFrameRef, VideoRuntimeBackend},
+        types::{VideoFrameLoadState, VideoFrameRef, VideoRuntimeBackend},
     },
 };
 use iced::Task;
@@ -383,6 +383,22 @@ impl VideoBackend for CpuBackend {
                     .filter(|frame| Self::frame_is_usable(frame))
             })
             .map(VideoFrameRef::Cpu)
+    }
+
+    fn preview_load_state(&self, clip: &VideoClip) -> Option<VideoFrameLoadState> {
+        if self.preview_frame(clip).is_some() {
+            None
+        } else {
+            Some(VideoFrameLoadState::Loading)
+        }
+    }
+
+    fn current_load_state(&self, clip: &VideoClip) -> Option<VideoFrameLoadState> {
+        if self.current_frame(clip).is_some() {
+            None
+        } else {
+            Some(VideoFrameLoadState::Loading)
+        }
     }
 
     fn request_preview_frame(

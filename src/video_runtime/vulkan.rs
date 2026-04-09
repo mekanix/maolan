@@ -21,6 +21,7 @@ use maolan_engine::{
 use std::{
     collections::{HashMap, HashSet},
     ffi::CStr,
+    fmt,
     sync::OnceLock,
     sync::{Arc, Mutex},
 };
@@ -53,11 +54,46 @@ struct ProducedFrame {
     fallback_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
+struct HardwareDeviceSpec {
+    producer_label: &'static str,
+    ffmpeg_label: &'static str,
+    device_type: ffi::AVHWDeviceType,
+}
+
+const VULKAN_DEVICE_SPEC: HardwareDeviceSpec = HardwareDeviceSpec {
+    producer_label: "vulkan-hardware",
+    ffmpeg_label: "vulkan",
+    device_type: ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+};
+
+const VAAPI_DEVICE_SPEC: HardwareDeviceSpec = HardwareDeviceSpec {
+    producer_label: "vaapi-upload",
+    ffmpeg_label: "vaapi",
+    device_type: ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
 pub enum VulkanFrameProducerKind {
     CpuUpload,
     Hardware,
+    #[default]
     Auto,
+}
+
+impl VulkanFrameProducerKind {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::CpuUpload, Self::Hardware];
+}
+
+impl fmt::Display for VulkanFrameProducerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => write!(f, "Auto"),
+            Self::CpuUpload => write!(f, "CPU Upload"),
+            Self::Hardware => write!(f, "Hardware"),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -103,6 +139,11 @@ struct HardwareDecodeProducer {
     decoders: Mutex<HashMap<String, HardwareDecoderState>>,
 }
 
+#[derive(Default)]
+struct VaapiDecodeProducer {
+    decoders: Mutex<HashMap<String, HardwareDecoderState>>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct HardwareProbeResult {
@@ -128,6 +169,7 @@ struct OpenedHardwareDecoder {
 }
 
 struct HardwareDecoderState {
+    device: HardwareDeviceSpec,
     clip: VideoClipData,
     sample_rate: f64,
     input: format::context::Input,
@@ -150,12 +192,12 @@ unsafe impl Sync for HardwareDecoderState {}
 struct HwDeviceRef(*mut ffi::AVBufferRef);
 
 impl HwDeviceRef {
-    fn create_vulkan() -> Result<Self, String> {
+    fn create(spec: HardwareDeviceSpec) -> Result<Self, String> {
         let mut device = std::ptr::null_mut();
         let result = unsafe {
             ffi::av_hwdevice_ctx_create(
                 &mut device,
-                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+                spec.device_type,
                 std::ptr::null(),
                 std::ptr::null_mut(),
                 0,
@@ -163,12 +205,16 @@ impl HwDeviceRef {
         };
         if result < 0 {
             return Err(format!(
-                "av_hwdevice_ctx_create(vulkan) failed: {}",
-                ffmpeg_error_string(result)
+                "av_hwdevice_ctx_create({}) failed: {}",
+                spec.ffmpeg_label,
+                ffmpeg_error_string(result),
             ));
         }
         if device.is_null() {
-            return Err("av_hwdevice_ctx_create(vulkan) returned a null device".to_string());
+            return Err(format!(
+                "av_hwdevice_ctx_create({}) returned a null device",
+                spec.ffmpeg_label
+            ));
         }
         Ok(Self(device))
     }
@@ -218,20 +264,23 @@ fn av_pix_fmt_name(format: ffi::AVPixelFormat) -> Option<String> {
 }
 
 #[allow(dead_code)]
-fn has_vulkan_hwdevice_support() -> bool {
+fn has_hwdevice_support(device_type: ffi::AVHWDeviceType) -> bool {
     let mut current = ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
     loop {
         current = unsafe { ffi::av_hwdevice_iterate_types(current) };
         if current == ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
             return false;
         }
-        if current == ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN {
+        if current == device_type {
             return true;
         }
     }
 }
 
-fn codec_supports_vulkan(codec: codec::codec::Codec) -> Result<HardwareProbeResult, String> {
+fn codec_supports_hwdevice(
+    codec: codec::codec::Codec,
+    device: HardwareDeviceSpec,
+) -> Result<HardwareProbeResult, String> {
     let codec_name = codec.name().to_string();
     let mut index = 0;
     let mut hw_pix_fmt = None;
@@ -246,7 +295,7 @@ fn codec_supports_vulkan(codec: codec::codec::Codec) -> Result<HardwareProbeResu
         }
 
         let config = unsafe { &*config };
-        if config.device_type == ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN {
+        if config.device_type == device.device_type {
             hw_pix_fmt = Some(config.pix_fmt);
             hw_pix_fmt_name = av_pix_fmt_name(config.pix_fmt);
             let methods = config.methods;
@@ -259,7 +308,8 @@ fn codec_supports_vulkan(codec: codec::codec::Codec) -> Result<HardwareProbeResu
 
     if !device_method && !frames_method {
         return Err(format!(
-            "codec `{codec_name}` exposes no Vulkan hardware configuration"
+            "codec `{codec_name}` exposes no {} hardware configuration",
+            device.ffmpeg_label
         ));
     }
 
@@ -272,12 +322,56 @@ fn codec_supports_vulkan(codec: codec::codec::Codec) -> Result<HardwareProbeResu
     })
 }
 
+fn find_hwdevice_decoder(
+    codec_id: codec::Id,
+    device: HardwareDeviceSpec,
+) -> Result<(codec::codec::Codec, HardwareProbeResult), String> {
+    let mut iterator_state = std::ptr::null_mut();
+    let mut fallback_reason = None::<String>;
+
+    loop {
+        let codec_ptr = unsafe { ffi::av_codec_iterate(&mut iterator_state) };
+        if codec_ptr.is_null() {
+            break;
+        }
+
+        let codec = unsafe { codec::codec::Codec::wrap(codec_ptr) };
+        if !codec.is_decoder() || codec.medium() != media::Type::Video || codec.id() != codec_id {
+            continue;
+        }
+
+        match codec_supports_hwdevice(codec, device) {
+            Ok(probe) => return Ok((codec, probe)),
+            Err(reason) => {
+                if fallback_reason.is_none() {
+                    fallback_reason = Some(reason);
+                }
+            }
+        }
+    }
+
+    if let Some(reason) = fallback_reason {
+        Err(reason)
+    } else {
+        Err(format!(
+            "no video decoder found for codec id {:?} with {} hardware support",
+            codec_id, device.ffmpeg_label
+        ))
+    }
+}
+
 #[allow(dead_code)]
-fn probe_hardware_decode_support(clip: &VideoClipData) -> Result<HardwareProbeResult, String> {
+fn probe_hardware_decode_support(
+    clip: &VideoClipData,
+    device: HardwareDeviceSpec,
+) -> Result<HardwareProbeResult, String> {
     ffmpeg_init().map_err(|e| format!("ffmpeg init failed: {e}"))?;
 
-    if !has_vulkan_hwdevice_support() {
-        return Err("FFmpeg was built without Vulkan hwdevice support".to_string());
+    if !has_hwdevice_support(device.device_type) {
+        return Err(format!(
+            "FFmpeg was built without {} hwdevice support",
+            device.ffmpeg_label
+        ));
     }
 
     let input = format::input(&clip.path).map_err(|e| format!("open video failed: {e}"))?;
@@ -286,11 +380,9 @@ fn probe_hardware_decode_support(clip: &VideoClipData) -> Result<HardwareProbeRe
     };
 
     let parameters = stream.parameters();
-    let codec = codec::decoder::find(parameters.id())
-        .ok_or_else(|| format!("video decoder not found for codec id {:?}", parameters.id()))?;
-    let probe = codec_supports_vulkan(codec)?;
+    let (_, probe) = find_hwdevice_decoder(parameters.id(), device)?;
 
-    let _device = HwDeviceRef::create_vulkan()?;
+    let _device = HwDeviceRef::create(device)?;
 
     Ok(probe)
 }
@@ -352,7 +444,10 @@ unsafe extern "C" fn select_vulkan_pixel_format(
     }
 }
 
-fn open_hardware_decoder(clip: &VideoClipData) -> Result<OpenedHardwareDecoder, String> {
+fn open_hardware_decoder(
+    clip: &VideoClipData,
+    device: HardwareDeviceSpec,
+) -> Result<OpenedHardwareDecoder, String> {
     ffmpeg_init().map_err(|e| format!("ffmpeg init failed: {e}"))?;
 
     let input = format::input(&clip.path).map_err(|e| format!("open video failed: {e}"))?;
@@ -362,24 +457,28 @@ fn open_hardware_decoder(clip: &VideoClipData) -> Result<OpenedHardwareDecoder, 
     let parameters = stream.parameters();
     let stream_index = stream.index();
     let time_base = stream.time_base();
-    let codec = codec::decoder::find(parameters.id())
-        .ok_or_else(|| format!("video decoder not found for codec id {:?}", parameters.id()))?;
-    let probe = codec_supports_vulkan(codec)?;
-    let hw_pix_fmt = probe
-        .hw_pix_fmt
-        .ok_or_else(|| format!("codec `{}` has no Vulkan hw pixel format", probe.codec_name))?;
+    let (codec, probe) = find_hwdevice_decoder(parameters.id(), device)?;
+    let hw_pix_fmt = probe.hw_pix_fmt.ok_or_else(|| {
+        format!(
+            "codec `{}` has no {} hw pixel format",
+            probe.codec_name, device.ffmpeg_label
+        )
+    })?;
 
-    let device = HwDeviceRef::create_vulkan()?;
+    let device_ref = HwDeviceRef::create(device)?;
     let mut context = codec::Context::from_parameters(parameters)
         .map_err(|e| format!("video codec params failed: {e}"))?;
 
     unsafe {
         let avctx = context.as_mut_ptr();
-        let device_ref = ffi::av_buffer_ref(device.0.cast_const());
-        if device_ref.is_null() {
-            return Err("failed to duplicate Vulkan hw device reference".to_string());
+        let hw_device_ref = ffi::av_buffer_ref(device_ref.0.cast_const());
+        if hw_device_ref.is_null() {
+            return Err(format!(
+                "failed to duplicate {} hw device reference",
+                device.ffmpeg_label
+            ));
         }
-        (*avctx).hw_device_ctx = device_ref;
+        (*avctx).hw_device_ctx = hw_device_ref;
         (*avctx).get_format = Some(select_vulkan_pixel_format);
 
         let selection = Box::new(HardwareFormatSelection {
@@ -398,7 +497,8 @@ fn open_hardware_decoder(clip: &VideoClipData) -> Result<OpenedHardwareDecoder, 
 
         if open_result < 0 {
             return Err(format!(
-                "avcodec_open2 for Vulkan hw decode failed: {}",
+                "avcodec_open2 for {} hw decode failed: {}",
+                device.ffmpeg_label,
                 ffmpeg_error_string(open_result)
             ));
         }
@@ -607,8 +707,8 @@ fn decode_hardware_frame_at_sample(
 
     let hw_pix_fmt = state.probe.hw_pix_fmt.ok_or_else(|| {
         format!(
-            "codec `{}` has no Vulkan hw pixel format",
-            state.probe.codec_name
+            "codec `{}` has no {} hw pixel format",
+            state.probe.codec_name, state.device.ffmpeg_label
         )
     })?;
     let mut fallback = state.last_frame.clone();
@@ -636,7 +736,7 @@ fn decode_hardware_frame_at_sample(
             {
                 return Ok(ProducedFrame {
                     frame: Arc::new(UnsafeMutex::new(frame_buffer)),
-                    producer_label: "hardware".to_string(),
+                    producer_label: state.device.producer_label.to_string(),
                     fallback_reason: None,
                 });
             }
@@ -656,7 +756,7 @@ fn decode_hardware_frame_at_sample(
         {
             return Ok(ProducedFrame {
                 frame: Arc::new(UnsafeMutex::new(frame_buffer)),
-                producer_label: "hardware".to_string(),
+                producer_label: state.device.producer_label.to_string(),
                 fallback_reason: None,
             });
         }
@@ -665,7 +765,7 @@ fn decode_hardware_frame_at_sample(
     fallback
         .map(|frame_buffer| ProducedFrame {
             frame: Arc::new(UnsafeMutex::new(frame_buffer)),
-            producer_label: "hardware".to_string(),
+            producer_label: state.device.producer_label.to_string(),
             fallback_reason: None,
         })
         .ok_or_else(|| "no decoded hardware video frame available".to_string())
@@ -717,8 +817,8 @@ fn decode_hardware_preview_strip(
 
     let hw_pix_fmt = state.probe.hw_pix_fmt.ok_or_else(|| {
         format!(
-            "codec `{}` has no Vulkan hw pixel format",
-            state.probe.codec_name
+            "codec `{}` has no {} hw pixel format",
+            state.probe.codec_name, state.device.ffmpeg_label
         )
     })?;
 
@@ -817,12 +917,16 @@ fn decode_hardware_preview_strip(
             rgba: strip,
             pts_samples: state.clip.start,
         })),
-        producer_label: "hardware".to_string(),
+        producer_label: state.device.producer_label.to_string(),
         fallback_reason: None,
     })
 }
 
 impl HardwareDecodeProducer {
+    fn new() -> Self {
+        Self::default()
+    }
+
     fn clip_runtime_key(clip: &VideoClipData) -> String {
         format!(
             "{}:{}:{}:{}",
@@ -843,6 +947,7 @@ impl HardwareDecodeProducer {
 
     fn decoder_state<'a>(
         &'a self,
+        device: HardwareDeviceSpec,
         clip: &VideoClipData,
         sample_rate: f64,
     ) -> Result<std::sync::MutexGuard<'a, HashMap<String, HardwareDecoderState>>, String> {
@@ -852,10 +957,11 @@ impl HardwareDecodeProducer {
             .map_err(|_| "hardware decoder cache poisoned".to_string())?;
         let key = Self::clip_cache_key(clip, sample_rate);
         if !decoders.contains_key(&key) {
-            let opened = open_hardware_decoder(clip)?;
+            let opened = open_hardware_decoder(clip, device)?;
             decoders.insert(
                 key.clone(),
                 HardwareDecoderState {
+                    device,
                     clip: clip.clone(),
                     sample_rate,
                     input: opened.input,
@@ -878,7 +984,7 @@ impl HardwareDecodeProducer {
 
 impl FrameProducer for HardwareDecodeProducer {
     fn label(&self) -> &'static str {
-        "hardware"
+        VULKAN_DEVICE_SPEC.producer_label
     }
 
     fn decode_preview(
@@ -887,7 +993,7 @@ impl FrameProducer for HardwareDecodeProducer {
         sample_rate: f64,
     ) -> Result<ProducedFrame, String> {
         let key = Self::clip_cache_key(clip, sample_rate);
-        let mut decoders = self.decoder_state(clip, sample_rate)?;
+        let mut decoders = self.decoder_state(VULKAN_DEVICE_SPEC, clip, sample_rate)?;
         let state = decoders
             .get_mut(&key)
             .ok_or_else(|| "hardware decoder state missing after insert".to_string())?;
@@ -901,7 +1007,7 @@ impl FrameProducer for HardwareDecodeProducer {
         sample: usize,
     ) -> Result<ProducedFrame, String> {
         let key = Self::clip_cache_key(clip, sample_rate);
-        let mut decoders = self.decoder_state(clip, sample_rate)?;
+        let mut decoders = self.decoder_state(VULKAN_DEVICE_SPEC, clip, sample_rate)?;
         let state = decoders
             .get_mut(&key)
             .ok_or_else(|| "hardware decoder state missing after insert".to_string())?;
@@ -916,20 +1022,54 @@ impl FrameProducer for HardwareDecodeProducer {
     }
 }
 
-struct FallbackFrameProducer {
-    primary: Arc<dyn FrameProducer>,
-    fallback: Arc<dyn FrameProducer>,
-}
+impl VaapiDecodeProducer {
+    fn clip_runtime_key(clip: &VideoClipData) -> String {
+        HardwareDecodeProducer::clip_runtime_key(clip)
+    }
 
-impl FallbackFrameProducer {
-    fn new(primary: Arc<dyn FrameProducer>, fallback: Arc<dyn FrameProducer>) -> Self {
-        Self { primary, fallback }
+    fn clip_cache_key(clip: &VideoClipData, sample_rate: f64) -> String {
+        HardwareDecodeProducer::clip_cache_key(clip, sample_rate)
+    }
+
+    fn decoder_state<'a>(
+        &'a self,
+        clip: &VideoClipData,
+        sample_rate: f64,
+    ) -> Result<std::sync::MutexGuard<'a, HashMap<String, HardwareDecoderState>>, String> {
+        let mut decoders = self
+            .decoders
+            .lock()
+            .map_err(|_| "vaapi decoder cache poisoned".to_string())?;
+        let key = Self::clip_cache_key(clip, sample_rate);
+        if !decoders.contains_key(&key) {
+            let opened = open_hardware_decoder(clip, VAAPI_DEVICE_SPEC)?;
+            decoders.insert(
+                key.clone(),
+                HardwareDecoderState {
+                    device: VAAPI_DEVICE_SPEC,
+                    clip: clip.clone(),
+                    sample_rate,
+                    input: opened.input,
+                    stream_index: opened.stream_index,
+                    time_base: opened.time_base,
+                    decoder: opened.decoder,
+                    probe: opened.probe,
+                    decoded: frame::Video::empty(),
+                    transferred: frame::Video::empty(),
+                    rgba: frame::Video::empty(),
+                    scaler: None,
+                    current_seconds: None,
+                    last_frame: None,
+                },
+            );
+        }
+        Ok(decoders)
     }
 }
 
-impl FrameProducer for FallbackFrameProducer {
+impl FrameProducer for VaapiDecodeProducer {
     fn label(&self) -> &'static str {
-        "fallback"
+        VAAPI_DEVICE_SPEC.producer_label
     }
 
     fn decode_preview(
@@ -937,12 +1077,123 @@ impl FrameProducer for FallbackFrameProducer {
         clip: &VideoClipData,
         sample_rate: f64,
     ) -> Result<ProducedFrame, String> {
-        match self.primary.decode_preview(clip, sample_rate) {
-            Ok(frame) => Ok(frame),
-            Err(primary_err) => {
+        let key = Self::clip_cache_key(clip, sample_rate);
+        let mut decoders = self.decoder_state(clip, sample_rate)?;
+        let state = decoders
+            .get_mut(&key)
+            .ok_or_else(|| "vaapi decoder state missing after insert".to_string())?;
+        decode_hardware_preview_strip(state)
+    }
+
+    fn decode_current(
+        &self,
+        clip: &VideoClipData,
+        sample_rate: f64,
+        sample: usize,
+    ) -> Result<ProducedFrame, String> {
+        let key = Self::clip_cache_key(clip, sample_rate);
+        let mut decoders = self.decoder_state(clip, sample_rate)?;
+        let state = decoders
+            .get_mut(&key)
+            .ok_or_else(|| "vaapi decoder state missing after insert".to_string())?;
+        decode_hardware_frame_at_sample(state, sample)
+    }
+
+    fn retain_clip_keys(&self, clip_keys: &HashSet<String>) {
+        let Ok(mut decoders) = self.decoders.lock() else {
+            return;
+        };
+        decoders.retain(|_, state| clip_keys.contains(&Self::clip_runtime_key(&state.clip)));
+    }
+}
+
+#[derive(Debug, Clone)]
+enum HardwareDecodeRoute {
+    Primary,
+    Fallback(String),
+}
+
+struct CapabilityAwareFrameProducer {
+    primary: Arc<dyn FrameProducer>,
+    fallback: Arc<dyn FrameProducer>,
+    support_cache: Mutex<HashMap<String, HardwareDecodeRoute>>,
+}
+
+impl CapabilityAwareFrameProducer {
+    fn new(primary: Arc<dyn FrameProducer>, fallback: Arc<dyn FrameProducer>) -> Self {
+        Self {
+            primary,
+            fallback,
+            support_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn clip_runtime_key(clip: &VideoClipData) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            clip.path, clip.start, clip.length, clip.offset
+        )
+    }
+
+    fn route_for_clip(
+        &self,
+        clip: &VideoClipData,
+        probe_device: Option<HardwareDeviceSpec>,
+    ) -> HardwareDecodeRoute {
+        let key = Self::clip_runtime_key(clip);
+        if let Ok(cache) = self.support_cache.lock()
+            && let Some(route) = cache.get(&key)
+        {
+            return route.clone();
+        }
+
+        let route = match probe_device {
+            Some(device) => match probe_hardware_decode_support(clip, device) {
+                Ok(_) => HardwareDecodeRoute::Primary,
+                Err(reason) => HardwareDecodeRoute::Fallback(reason),
+            },
+            None => HardwareDecodeRoute::Primary,
+        };
+
+        if let Ok(mut cache) = self.support_cache.lock() {
+            cache.insert(key, route.clone());
+        }
+
+        route
+    }
+
+    fn mark_fallback(&self, clip: &VideoClipData, reason: String) {
+        let key = Self::clip_runtime_key(clip);
+        if let Ok(mut cache) = self.support_cache.lock() {
+            cache.insert(key, HardwareDecodeRoute::Fallback(reason));
+        }
+    }
+}
+
+impl FrameProducer for CapabilityAwareFrameProducer {
+    fn label(&self) -> &'static str {
+        "capability-aware"
+    }
+
+    fn decode_preview(
+        &self,
+        clip: &VideoClipData,
+        sample_rate: f64,
+    ) -> Result<ProducedFrame, String> {
+        match self.route_for_clip(clip, None) {
+            HardwareDecodeRoute::Primary => match self.primary.decode_preview(clip, sample_rate) {
+                Ok(frame) => Ok(frame),
+                Err(primary_err) => {
+                    let mut frame = self.fallback.decode_preview(clip, sample_rate)?;
+                    frame.fallback_reason =
+                        Some(format!("{} -> {}", self.primary.label(), primary_err));
+                    Ok(frame)
+                }
+            },
+            HardwareDecodeRoute::Fallback(reason) => {
                 let mut frame = self.fallback.decode_preview(clip, sample_rate)?;
                 frame.fallback_reason =
-                    Some(format!("{} -> {}", self.primary.label(), primary_err));
+                    Some(format!("{} probe -> {}", self.primary.label(), reason));
                 Ok(frame)
             }
         }
@@ -954,12 +1205,22 @@ impl FrameProducer for FallbackFrameProducer {
         sample_rate: f64,
         sample: usize,
     ) -> Result<ProducedFrame, String> {
-        match self.primary.decode_current(clip, sample_rate, sample) {
-            Ok(frame) => Ok(frame),
-            Err(primary_err) => {
+        match self.route_for_clip(clip, None) {
+            HardwareDecodeRoute::Primary => {
+                match self.primary.decode_current(clip, sample_rate, sample) {
+                    Ok(frame) => Ok(frame),
+                    Err(primary_err) => {
+                        let mut frame = self.fallback.decode_current(clip, sample_rate, sample)?;
+                        frame.fallback_reason =
+                            Some(format!("{} -> {}", self.primary.label(), primary_err));
+                        Ok(frame)
+                    }
+                }
+            }
+            HardwareDecodeRoute::Fallback(reason) => {
                 let mut frame = self.fallback.decode_current(clip, sample_rate, sample)?;
                 frame.fallback_reason =
-                    Some(format!("{} -> {}", self.primary.label(), primary_err));
+                    Some(format!("{} probe -> {}", self.primary.label(), reason));
                 Ok(frame)
             }
         }
@@ -968,6 +1229,139 @@ impl FrameProducer for FallbackFrameProducer {
     fn retain_clip_keys(&self, clip_keys: &HashSet<String>) {
         self.primary.retain_clip_keys(clip_keys);
         self.fallback.retain_clip_keys(clip_keys);
+        let Ok(mut cache) = self.support_cache.lock() else {
+            return;
+        };
+        cache.retain(|clip_key, _| clip_keys.contains(clip_key));
+    }
+}
+
+struct ProbedFrameProducer {
+    probe_device: HardwareDeviceSpec,
+    inner: CapabilityAwareFrameProducer,
+}
+
+impl ProbedFrameProducer {
+    fn new(
+        probe_device: HardwareDeviceSpec,
+        primary: Arc<dyn FrameProducer>,
+        fallback: Arc<dyn FrameProducer>,
+    ) -> Self {
+        Self {
+            probe_device,
+            inner: CapabilityAwareFrameProducer::new(primary, fallback),
+        }
+    }
+}
+
+impl FrameProducer for ProbedFrameProducer {
+    fn label(&self) -> &'static str {
+        self.inner.primary.label()
+    }
+
+    fn decode_preview(
+        &self,
+        clip: &VideoClipData,
+        sample_rate: f64,
+    ) -> Result<ProducedFrame, String> {
+        match self.inner.route_for_clip(clip, Some(self.probe_device)) {
+            HardwareDecodeRoute::Primary => {
+                eprintln!(
+                    "[video-runtime] trying {} preview decode for {}",
+                    self.inner.primary.label(),
+                    clip.path
+                );
+                match self.inner.primary.decode_preview(clip, sample_rate) {
+                    Ok(frame) => Ok(frame),
+                    Err(primary_err) => {
+                        self.inner.mark_fallback(clip, primary_err.clone());
+                        eprintln!(
+                            "[video-runtime] {} preview failed for {}: {}",
+                            self.inner.primary.label(),
+                            clip.path,
+                            primary_err
+                        );
+                        let mut frame = self.inner.fallback.decode_preview(clip, sample_rate)?;
+                        frame.fallback_reason =
+                            Some(format!("{} -> {}", self.inner.primary.label(), primary_err));
+                        Ok(frame)
+                    }
+                }
+            }
+            HardwareDecodeRoute::Fallback(reason) => {
+                eprintln!(
+                    "[video-runtime] {} preview probe failed for {}: {}",
+                    self.inner.primary.label(),
+                    clip.path,
+                    reason
+                );
+                let mut frame = self.inner.fallback.decode_preview(clip, sample_rate)?;
+                frame.fallback_reason = Some(format!(
+                    "{} probe -> {}",
+                    self.inner.primary.label(),
+                    reason
+                ));
+                Ok(frame)
+            }
+        }
+    }
+
+    fn decode_current(
+        &self,
+        clip: &VideoClipData,
+        sample_rate: f64,
+        sample: usize,
+    ) -> Result<ProducedFrame, String> {
+        match self.inner.route_for_clip(clip, Some(self.probe_device)) {
+            HardwareDecodeRoute::Primary => {
+                eprintln!(
+                    "[video-runtime] trying {} current decode for {}",
+                    self.inner.primary.label(),
+                    clip.path
+                );
+                match self.inner.primary.decode_current(clip, sample_rate, sample) {
+                    Ok(frame) => Ok(frame),
+                    Err(primary_err) => {
+                        self.inner.mark_fallback(clip, primary_err.clone());
+                        eprintln!(
+                            "[video-runtime] {} current failed for {}: {}",
+                            self.inner.primary.label(),
+                            clip.path,
+                            primary_err
+                        );
+                        let mut frame =
+                            self.inner
+                                .fallback
+                                .decode_current(clip, sample_rate, sample)?;
+                        frame.fallback_reason =
+                            Some(format!("{} -> {}", self.inner.primary.label(), primary_err));
+                        Ok(frame)
+                    }
+                }
+            }
+            HardwareDecodeRoute::Fallback(reason) => {
+                eprintln!(
+                    "[video-runtime] {} current probe failed for {}: {}",
+                    self.inner.primary.label(),
+                    clip.path,
+                    reason
+                );
+                let mut frame = self
+                    .inner
+                    .fallback
+                    .decode_current(clip, sample_rate, sample)?;
+                frame.fallback_reason = Some(format!(
+                    "{} probe -> {}",
+                    self.inner.primary.label(),
+                    reason
+                ));
+                Ok(frame)
+            }
+        }
+    }
+
+    fn retain_clip_keys(&self, clip_keys: &HashSet<String>) {
+        self.inner.retain_clip_keys(clip_keys);
     }
 }
 
@@ -978,6 +1372,7 @@ struct DecodeRequestState {
     sample: usize,
     generation: u64,
     inflight_generation: Option<u64>,
+    last_error: Option<String>,
 }
 
 struct DecodeTask {
@@ -1013,6 +1408,8 @@ pub struct VulkanRuntimeConfig {
 
 pub struct VulkanBackend {
     config: Option<VulkanRuntimeConfig>,
+    #[allow(dead_code)]
+    producer_kind: VulkanFrameProducerKind,
     producer: Arc<dyn FrameProducer>,
     textures: Arc<Mutex<VideoTextureRegistry>>,
     preview_slots: Arc<Mutex<HashMap<String, VideoTextureHandle>>>,
@@ -1026,6 +1423,7 @@ impl VulkanBackend {
     pub fn new() -> Self {
         Self {
             config: None,
+            producer_kind: VulkanFrameProducerKind::CpuUpload,
             producer: Arc::new(CpuUploadProducer),
             textures: Arc::new(Mutex::new(VideoTextureRegistry::new())),
             preview_slots: Arc::new(Mutex::new(HashMap::new())),
@@ -1039,6 +1437,7 @@ impl VulkanBackend {
     pub fn with_config(config: VulkanRuntimeConfig) -> Self {
         Self {
             config: Some(config),
+            producer_kind: VulkanFrameProducerKind::CpuUpload,
             producer: Arc::new(CpuUploadProducer),
             textures: Arc::new(Mutex::new(VideoTextureRegistry::new())),
             preview_slots: Arc::new(Mutex::new(HashMap::new())),
@@ -1046,6 +1445,10 @@ impl VulkanBackend {
             preview_requests: Arc::new(Mutex::new(HashMap::new())),
             current_requests: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.config.is_some()
     }
 
     pub fn with_producer_kind(
@@ -1059,12 +1462,23 @@ impl VulkanBackend {
             VulkanFrameProducerKind::Hardware => Self::hardware_preferred_producer(),
             VulkanFrameProducerKind::Auto => Self::default_producer_from_env(),
         };
-        Self::with_frame_producer(config, producer)
+        Self {
+            config: Some(config),
+            producer_kind,
+            producer,
+            textures: Arc::new(Mutex::new(VideoTextureRegistry::new())),
+            preview_slots: Arc::new(Mutex::new(HashMap::new())),
+            current_slots: Arc::new(Mutex::new(HashMap::new())),
+            preview_requests: Arc::new(Mutex::new(HashMap::new())),
+            current_requests: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
+    #[allow(dead_code)]
     fn with_frame_producer(config: VulkanRuntimeConfig, producer: Arc<dyn FrameProducer>) -> Self {
         Self {
             config: Some(config),
+            producer_kind: VulkanFrameProducerKind::CpuUpload,
             producer,
             textures: Arc::new(Mutex::new(VideoTextureRegistry::new())),
             preview_slots: Arc::new(Mutex::new(HashMap::new())),
@@ -1083,10 +1497,20 @@ impl VulkanBackend {
         self.textures.clone()
     }
 
+    #[allow(dead_code)]
+    pub fn producer_kind(&self) -> VulkanFrameProducerKind {
+        self.producer_kind
+    }
+
     fn hardware_preferred_producer() -> Arc<dyn FrameProducer> {
-        Arc::new(FallbackFrameProducer::new(
-            Arc::new(HardwareDecodeProducer::default()),
-            Arc::new(CpuUploadProducer),
+        Arc::new(ProbedFrameProducer::new(
+            VULKAN_DEVICE_SPEC,
+            Arc::new(HardwareDecodeProducer::new()),
+            Arc::new(ProbedFrameProducer::new(
+                VAAPI_DEVICE_SPEC,
+                Arc::new(VaapiDecodeProducer::default()),
+                Arc::new(CpuUploadProducer),
+            )),
         ))
     }
 
@@ -1116,6 +1540,40 @@ impl VulkanBackend {
             "{}:{}:{}:{}",
             clip.path, clip.start, clip.length, clip.offset
         )
+    }
+
+    fn parse_clip_key(clip_key: &str) -> Option<(&str, usize, usize, usize)> {
+        let mut parts = clip_key.rsplitn(4, ':');
+        let offset = parts.next()?.parse().ok()?;
+        let length = parts.next()?.parse().ok()?;
+        let start = parts.next()?.parse().ok()?;
+        let path = parts.next()?;
+        Some((path, start, length, offset))
+    }
+
+    fn clip_paths_match(request_path: &str, clip_path: &str) -> bool {
+        request_path == clip_path
+            || request_path.ends_with(clip_path)
+            || request_path.ends_with(&format!("/{clip_path}"))
+    }
+
+    fn lookup_slot_handle(
+        slots: &Arc<Mutex<HashMap<String, VideoTextureHandle>>>,
+        clip: &VideoClip,
+    ) -> Option<VideoTextureHandle> {
+        let clip_key = Self::clip_key(clip);
+        let slots = slots.lock().ok()?;
+        if let Some(handle) = slots.get(&clip_key).copied() {
+            return Some(handle);
+        }
+        slots.iter().find_map(|(registered_key, handle)| {
+            let (path, start, length, offset) = Self::parse_clip_key(registered_key)?;
+            (start == clip.start
+                && length == clip.length
+                && offset == clip.offset
+                && Self::clip_paths_match(path, &clip.path))
+            .then_some(*handle)
+        })
     }
 
     fn evict_slots(
@@ -1158,33 +1616,6 @@ impl VulkanBackend {
         }
     }
 
-    fn placeholder_metadata(clip: &VideoClip, sample: usize) -> VideoFrameMetadata {
-        let local_sample = sample
-            .saturating_sub(clip.start)
-            .saturating_add(clip.offset)
-            .min(clip.offset.saturating_add(clip.length));
-        VideoFrameMetadata {
-            width: 320,
-            height: 180,
-            pts_samples: local_sample,
-        }
-    }
-
-    fn placeholder_metadata_for_clip_data(
-        clip: &VideoClipData,
-        sample: usize,
-    ) -> VideoFrameMetadata {
-        let local_sample = sample
-            .saturating_sub(clip.start)
-            .saturating_add(clip.offset)
-            .min(clip.offset.saturating_add(clip.length));
-        VideoFrameMetadata {
-            width: 320,
-            height: 180,
-            pts_samples: local_sample,
-        }
-    }
-
     fn frame_source(
         produced: ProducedFrame,
     ) -> Option<(
@@ -1213,40 +1644,6 @@ impl VulkanBackend {
         ))
     }
 
-    fn placeholder_source(
-        &self,
-        metadata: VideoFrameMetadata,
-        sample: usize,
-    ) -> RegisteredVideoTextureSource {
-        let width = metadata.width.max(1);
-        let height = metadata.height.max(1);
-        let frame_phase = (sample / 2048) as u32;
-        let band = (frame_phase.wrapping_mul(7)) % width.max(1);
-        let mut pixels =
-            Vec::with_capacity(width.saturating_mul(height).saturating_mul(4) as usize);
-
-        for y in 0..height {
-            for x in 0..width {
-                let stripe = x.abs_diff(band) < 24;
-                let checker = ((x / 24) + (y / 24) + (frame_phase / 4)).is_multiple_of(2);
-                let rgba = if stripe {
-                    [224, 186, 72, 255]
-                } else if checker {
-                    [32, 96, 172, 255]
-                } else {
-                    [16, 28, 52, 255]
-                };
-                pixels.extend_from_slice(&rgba);
-            }
-        }
-
-        RegisteredVideoTextureSource::Rgba8 {
-            width,
-            height,
-            pixels,
-        }
-    }
-
     fn queue_request(
         requests: &Arc<Mutex<HashMap<String, DecodeRequestState>>>,
         clip_key: &str,
@@ -1263,32 +1660,19 @@ impl VulkanBackend {
                 sample,
                 generation: 0,
                 inflight_generation: None,
+                last_error: None,
             });
         entry.clip = clip;
         entry.sample_rate = sample_rate;
         entry.sample = sample;
         entry.generation = entry.generation.wrapping_add(1);
+        entry.last_error = None;
         let generation = entry.generation;
         let should_spawn = entry.inflight_generation.is_none();
         if should_spawn {
             entry.inflight_generation = Some(generation);
         }
         Some((generation, should_spawn))
-    }
-
-    fn request_sample(
-        requests: &Arc<Mutex<HashMap<String, DecodeRequestState>>>,
-        clip_key: &str,
-        fallback: usize,
-    ) -> Option<usize> {
-        Some(
-            requests
-                .lock()
-                .ok()?
-                .get(clip_key)
-                .map(|state| state.sample)
-                .unwrap_or(fallback),
-        )
     }
 
     fn spawn_decode_task(task: DecodeTask) -> Task<Message> {
@@ -1306,20 +1690,50 @@ impl VulkanBackend {
                     .ok()
                     .and_then(|requests| requests.get(&task.clip_key).cloned())
                     .is_some_and(|state| state.inflight_generation == Some(task.generation));
-                if can_commit
-                    && let Ok(frame) = result
-                    && let Some((metadata, source, producer_label, fallback_reason)) =
-                        Self::frame_source(frame)
-                {
-                    let _ = Self::upsert_texture(
-                        &task.textures,
-                        &task.slots,
-                        task.clip_key.clone(),
-                        metadata,
-                        source,
-                        producer_label,
-                        fallback_reason,
-                    );
+                if can_commit {
+                    match result {
+                        Ok(frame) => {
+                            if let Some((metadata, source, producer_label, fallback_reason)) =
+                                Self::frame_source(frame)
+                            {
+                                Self::log_decode_result(
+                                    &task.clip_key,
+                                    task.preview,
+                                    &producer_label,
+                                    fallback_reason.as_deref(),
+                                );
+                                let _ = Self::upsert_texture(
+                                    &task.textures,
+                                    &task.slots,
+                                    task.clip_key.clone(),
+                                    metadata,
+                                    source,
+                                    producer_label,
+                                    fallback_reason,
+                                );
+                            } else if let Ok(mut requests) = task.requests.lock()
+                                && let Some(state) = requests.get_mut(&task.clip_key)
+                                && state.inflight_generation == Some(task.generation)
+                            {
+                                state.last_error =
+                                    Some("decoded video frame was empty".to_string());
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[video-runtime] {} {} decode failed: {}",
+                                if task.preview { "preview" } else { "current" },
+                                task.clip_key,
+                                err
+                            );
+                            if let Ok(mut requests) = task.requests.lock()
+                                && let Some(state) = requests.get_mut(&task.clip_key)
+                                && state.inflight_generation == Some(task.generation)
+                            {
+                                state.last_error = Some(err);
+                            }
+                        }
+                    }
                 }
                 Message::VideoRuntimeDecodeFinished {
                     clip_key: task.clip_key,
@@ -1331,51 +1745,14 @@ impl VulkanBackend {
         )
     }
 
-    fn update_clip_frame(
-        &self,
-        clip: &VideoClip,
-        sample: usize,
-        preview: bool,
-    ) -> Option<(VideoTextureHandle, VideoFrameMetadata)> {
-        let metadata = Self::placeholder_metadata(clip, sample);
-        let handle = self.register_placeholder_frame(clip, metadata, sample, preview)?;
-        Some((handle, metadata))
-    }
-
     fn frame_ref_from_registry(
         &self,
         slots: &Arc<Mutex<HashMap<String, VideoTextureHandle>>>,
-        clip_key: &str,
+        clip: &VideoClip,
     ) -> Option<VideoFrameRef<'static>> {
-        let handle = slots.lock().ok()?.get(clip_key).copied()?;
+        let handle = Self::lookup_slot_handle(slots, clip)?;
         let metadata = self.textures.lock().ok()?.get(&handle)?.metadata;
         Some(VideoFrameRef::Gpu { handle, metadata })
-    }
-
-    fn register_placeholder_frame_for_clip_data(
-        &self,
-        clip: &VideoClipData,
-        sample: usize,
-        preview: bool,
-    ) -> Option<VideoTextureHandle> {
-        let _config = self.config.as_ref()?;
-        let metadata = Self::placeholder_metadata_for_clip_data(clip, sample);
-        let clip_key = Self::clip_data_key(clip);
-        let source = self.placeholder_source(metadata, sample);
-        let clip_slots = if preview {
-            &self.preview_slots
-        } else {
-            &self.current_slots
-        };
-        Self::upsert_texture(
-            &self.textures,
-            clip_slots,
-            clip_key,
-            metadata,
-            source,
-            "placeholder".to_string(),
-            None,
-        )
     }
 
     fn upsert_texture(
@@ -1413,30 +1790,38 @@ impl VulkanBackend {
         }
     }
 
-    pub fn register_placeholder_frame(
-        &self,
-        clip: &VideoClip,
-        metadata: VideoFrameMetadata,
-        sample: usize,
+    fn log_decode_result(
+        clip_key: &str,
         preview: bool,
-    ) -> Option<VideoTextureHandle> {
-        let _config = self.config.as_ref()?;
-        let clip_key = Self::clip_key(clip);
-        let source = self.placeholder_source(metadata, sample);
-        let clip_slots = if preview {
-            &self.preview_slots
+        producer_label: &str,
+        fallback_reason: Option<&str>,
+    ) {
+        let kind = if preview { "preview" } else { "current" };
+        match fallback_reason {
+            Some(reason) => {
+                eprintln!("[video-runtime] {kind} {clip_key} -> {producer_label} ({reason})");
+            }
+            None => {
+                eprintln!("[video-runtime] {kind} {clip_key} -> {producer_label}");
+            }
+        }
+    }
+
+    fn load_state_for_clip_key(
+        requests: &Arc<Mutex<HashMap<String, DecodeRequestState>>>,
+        clip_key: &str,
+    ) -> Option<crate::video_runtime::types::VideoFrameLoadState> {
+        let requests = requests.lock().ok()?;
+        let state = requests.get(clip_key)?;
+        if state.inflight_generation.is_some() {
+            Some(crate::video_runtime::types::VideoFrameLoadState::Loading)
         } else {
-            &self.current_slots
-        };
-        Self::upsert_texture(
-            &self.textures,
-            clip_slots,
-            clip_key,
-            metadata,
-            source,
-            "placeholder".to_string(),
-            None,
-        )
+            state
+                .last_error
+                .as_ref()
+                .cloned()
+                .map(crate::video_runtime::types::VideoFrameLoadState::Failed)
+        }
     }
 }
 
@@ -1447,26 +1832,45 @@ impl VideoBackend for VulkanBackend {
 
     fn preview_frame<'a>(&self, clip: &'a VideoClip) -> Option<VideoFrameRef<'a>> {
         let _config = self.config.as_ref()?;
-        let clip_key = Self::clip_key(clip);
-        self.frame_ref_from_registry(&self.preview_slots, &clip_key)
-            .or_else(|| {
-                let sample = Self::request_sample(&self.preview_requests, &clip_key, clip.start)?;
-                let (handle, metadata) = self.update_clip_frame(clip, sample, true)?;
-                Some(VideoFrameRef::Gpu { handle, metadata })
-            })
+        self.frame_ref_from_registry(&self.preview_slots, clip)
     }
 
     fn current_frame<'a>(&self, clip: &'a VideoClip) -> Option<VideoFrameRef<'a>> {
         let _config = self.config.as_ref()?;
+        self.frame_ref_from_registry(&self.current_slots, clip)
+    }
+
+    fn preview_load_state(
+        &self,
+        clip: &VideoClip,
+    ) -> Option<crate::video_runtime::types::VideoFrameLoadState> {
+        let _config = self.config.as_ref()?;
         let clip_key = Self::clip_key(clip);
-        self.frame_ref_from_registry(&self.current_slots, &clip_key)
-            .or_else(|| {
-                let sample = Self::request_sample(&self.current_requests, &clip_key, clip.start)
-                    .or_else(|| Self::request_sample(&self.preview_requests, &clip_key, clip.start))
-                    .unwrap_or(clip.start);
-                let (handle, metadata) = self.update_clip_frame(clip, sample, false)?;
-                Some(VideoFrameRef::Gpu { handle, metadata })
-            })
+        if self
+            .frame_ref_from_registry(&self.preview_slots, clip)
+            .is_some()
+        {
+            None
+        } else {
+            Self::load_state_for_clip_key(&self.preview_requests, &clip_key)
+        }
+    }
+
+    fn current_load_state(
+        &self,
+        clip: &VideoClip,
+    ) -> Option<crate::video_runtime::types::VideoFrameLoadState> {
+        let _config = self.config.as_ref()?;
+        let clip_key = Self::clip_key(clip);
+        if self
+            .frame_ref_from_registry(&self.current_slots, clip)
+            .is_some()
+        {
+            None
+        } else {
+            Self::load_state_for_clip_key(&self.current_requests, &clip_key)
+                .or_else(|| Self::load_state_for_clip_key(&self.preview_requests, &clip_key))
+        }
     }
 
     fn request_preview_frame(
@@ -1489,7 +1893,6 @@ impl VideoBackend for VulkanBackend {
         ) else {
             return Task::none();
         };
-        let _ = self.register_placeholder_frame_for_clip_data(&clip, clip.start, true);
         if should_spawn {
             Self::spawn_decode_task(DecodeTask {
                 producer: self.producer.clone(),
@@ -1529,7 +1932,6 @@ impl VideoBackend for VulkanBackend {
         ) else {
             return Task::none();
         };
-        let _ = self.register_placeholder_frame_for_clip_data(&clip, sample, false);
         if should_spawn {
             Self::spawn_decode_task(DecodeTask {
                 producer: self.producer.clone(),

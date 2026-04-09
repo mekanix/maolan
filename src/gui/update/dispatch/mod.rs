@@ -8413,6 +8413,12 @@ impl Maolan {
             Message::PreferencesBitDepthSelected(bits) => {
                 self.prefs_audio_bit_depth = bits;
             }
+            Message::PreferencesVideoBackendSelected(backend) => {
+                self.prefs_video_backend = backend;
+            }
+            Message::PreferencesVideoVulkanProducerSelected(producer_kind) => {
+                self.prefs_video_vulkan_producer = producer_kind;
+            }
             Message::PreferencesOscEnabledToggled(enabled) => {
                 self.prefs_osc_enabled = enabled;
             }
@@ -8430,6 +8436,8 @@ impl Maolan {
                 cfg.default_export_sample_rate_hz = self.prefs_export_sample_rate_hz;
                 cfg.default_snap_mode = self.prefs_snap_mode;
                 cfg.default_audio_bit_depth = self.prefs_audio_bit_depth;
+                cfg.default_video_backend = self.prefs_video_backend;
+                cfg.default_video_vulkan_producer = self.prefs_video_vulkan_producer;
                 cfg.default_output_device_id = self.prefs_default_output_device_id.clone();
                 cfg.default_input_device_id = self.prefs_default_input_device_id.clone();
                 let prefs = super::super::AppPreferences {
@@ -8437,6 +8445,8 @@ impl Maolan {
                     default_export_sample_rate_hz: cfg.default_export_sample_rate_hz,
                     default_snap_mode: cfg.default_snap_mode,
                     default_audio_bit_depth: cfg.default_audio_bit_depth,
+                    default_video_backend: cfg.default_video_backend,
+                    default_video_vulkan_producer: cfg.default_video_vulkan_producer,
                     default_output_device_id: cfg.default_output_device_id.clone(),
                     default_input_device_id: cfg.default_input_device_id.clone(),
                     recent_session_paths: cfg.recent_session_paths.clone(),
@@ -8445,6 +8455,10 @@ impl Maolan {
                     Ok(()) => {
                         self.export_sample_rate_hz = self.prefs_export_sample_rate_hz;
                         self.snap_mode = self.prefs_snap_mode;
+                        self.video_runtime.set_preferences(
+                            self.prefs_video_backend,
+                            self.prefs_video_vulkan_producer,
+                        );
                         let task = self.send(Action::SetOscEnabled(self.prefs_osc_enabled));
                         {
                             let mut state = self.state.blocking_write();

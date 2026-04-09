@@ -14,6 +14,33 @@ impl Video {
         Self { state }
     }
 
+    fn backend_label(video_runtime: &crate::video_runtime::VideoRuntime) -> &'static str {
+        match video_runtime.backend() {
+            crate::video_runtime::types::VideoRuntimeBackend::Cpu => "CPU",
+            crate::video_runtime::types::VideoRuntimeBackend::Vulkan => "Vulkan",
+        }
+    }
+
+    fn load_state_label(
+        video_runtime: &crate::video_runtime::VideoRuntime,
+        video: &crate::state::VideoClip,
+        current: bool,
+    ) -> Option<String> {
+        let state = if current {
+            video_runtime.current_load_state(video)
+        } else {
+            video_runtime.preview_load_state(video)
+        }?;
+        Some(match state {
+            crate::video_runtime::types::VideoFrameLoadState::Loading => {
+                format!("{} • loading", Self::backend_label(video_runtime))
+            }
+            crate::video_runtime::types::VideoFrameLoadState::Failed(err) => {
+                format!("{} • {}", Self::backend_label(video_runtime), err)
+            }
+        })
+    }
+
     fn panel_style() -> impl Fn(&iced::Theme) -> container::Style {
         |_theme| container::Style {
             background: Some(Background::Color(Color::from_rgba(0.13, 0.10, 0.04, 0.96))),
@@ -35,14 +62,16 @@ impl Video {
         if let Some(video) = video
             && let Some(frame) = video_runtime.current_frame(video)
         {
+            if let Some(handle) = video_runtime.image_handle(&frame) {
+                return image(handle)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(fit)
+                    .into();
+            }
+
             match video_runtime.presentable_frame(&frame) {
-                Some(crate::video_runtime::presenter::PresentableFrame::CpuImage(handle)) => {
-                    return image(handle)
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .content_fit(fit)
-                        .into();
-                }
+                Some(crate::video_runtime::presenter::PresentableFrame::CpuImage(_)) => {}
                 Some(crate::video_runtime::presenter::PresentableFrame::GpuTexture(handle)) => {
                     if let crate::video_runtime::types::VideoFrameRef::Gpu { metadata, .. } = frame
                         && let Some(registry) = video_runtime.texture_registry()
@@ -57,6 +86,17 @@ impl Video {
                 }
                 None => {}
             }
+        }
+
+        if let Some(video) = video
+            && let Some(label) = Self::load_state_label(video_runtime, video, true)
+        {
+            return container(column![text(unavailable).size(18), text(label).size(12)].spacing(8))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into();
         }
 
         container(text(unavailable).size(18))
@@ -154,7 +194,7 @@ impl Video {
             let left_width = state.video_preview_left_width.max(160.0);
             let middle_width = state.video_preview_middle_width.max(160.0);
             let right_group = row![
-                container(text("VFX").size(24))
+                container(text(format!("VFX {}", Self::backend_label(video_runtime))).size(24))
                     .width(Length::Fixed(middle_width))
                     .height(Length::Fill)
                     .center_x(Length::Fill)
@@ -246,7 +286,7 @@ impl Video {
                 .on_exit(Message::VideoPreviewSplitResizeHover(false))
                 .on_press(Message::VideoPreviewSplitResizeStart),
                 row![
-                    container(text("VFX").size(24))
+                    container(text(format!("VFX {}", Self::backend_label(video_runtime))).size(24))
                         .width(Length::Fixed(state.video_preview_middle_width.max(160.0)))
                         .height(Length::Fill)
                         .center_x(Length::Fill)

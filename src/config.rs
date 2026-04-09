@@ -1,5 +1,6 @@
 use crate::consts::audio_defaults;
 use crate::message::SnapMode;
+use crate::video_runtime::{types::VideoRuntimeBackendPreference, vulkan::VulkanFrameProducerKind};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -17,6 +18,8 @@ pub struct Config {
     pub default_export_sample_rate_hz: u32,
     pub default_snap_mode: SnapMode,
     pub default_audio_bit_depth: usize,
+    pub default_video_backend: VideoRuntimeBackendPreference,
+    pub default_video_vulkan_producer: VulkanFrameProducerKind,
 
     pub default_output_device_id: Option<String>,
     pub default_input_device_id: Option<String>,
@@ -36,6 +39,8 @@ impl Default for Config {
             default_export_sample_rate_hz: audio_defaults::SAMPLE_RATE_HZ as u32,
             default_snap_mode: SnapMode::Bar,
             default_audio_bit_depth: audio_defaults::BIT_DEPTH,
+            default_video_backend: VideoRuntimeBackendPreference::Auto,
+            default_video_vulkan_producer: VulkanFrameProducerKind::Auto,
 
             default_output_device_id: None,
             default_input_device_id: None,

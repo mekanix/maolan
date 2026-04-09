@@ -1,7 +1,7 @@
 use crate::{
     message::Message,
     state::VideoClip,
-    video_runtime::types::{VideoFrameRef, VideoRuntimeBackend},
+    video_runtime::types::{VideoFrameLoadState, VideoFrameRef, VideoRuntimeBackend},
 };
 use iced::Task;
 use maolan_engine::message::VideoClipData;
@@ -14,6 +14,10 @@ pub trait VideoBackend {
     fn preview_frame<'a>(&self, clip: &'a VideoClip) -> Option<VideoFrameRef<'a>>;
 
     fn current_frame<'a>(&self, clip: &'a VideoClip) -> Option<VideoFrameRef<'a>>;
+
+    fn preview_load_state(&self, clip: &VideoClip) -> Option<VideoFrameLoadState>;
+
+    fn current_load_state(&self, clip: &VideoClip) -> Option<VideoFrameLoadState>;
 
     fn request_preview_frame(
         &self,

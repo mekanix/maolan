@@ -7,6 +7,7 @@ mod view;
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::plugins::lv2::GuiLv2UiHost;
 use crate::video_runtime::cpu::VideoDecoderState;
+use crate::video_runtime::{types::VideoRuntimeBackendPreference, vulkan::VulkanFrameProducerKind};
 use crate::{
     add_track, clip_rename, config, connections,
     consts::audio_defaults,
@@ -275,6 +276,8 @@ struct AppPreferences {
     default_export_sample_rate_hz: u32,
     default_snap_mode: SnapMode,
     default_audio_bit_depth: usize,
+    default_video_backend: VideoRuntimeBackendPreference,
+    default_video_vulkan_producer: VulkanFrameProducerKind,
     default_output_device_id: Option<String>,
     default_input_device_id: Option<String>,
     recent_session_paths: Vec<String>,
@@ -287,6 +290,8 @@ impl Default for AppPreferences {
             default_export_sample_rate_hz: audio_defaults::SAMPLE_RATE_HZ as u32,
             default_snap_mode: SnapMode::Bar,
             default_audio_bit_depth: audio_defaults::BIT_DEPTH,
+            default_video_backend: VideoRuntimeBackendPreference::Auto,
+            default_video_vulkan_producer: VulkanFrameProducerKind::Auto,
             default_output_device_id: None,
             default_input_device_id: None,
             recent_session_paths: Vec::new(),
@@ -572,6 +577,8 @@ pub struct Maolan {
     prefs_export_sample_rate_hz: u32,
     prefs_snap_mode: SnapMode,
     prefs_audio_bit_depth: usize,
+    prefs_video_backend: VideoRuntimeBackendPreference,
+    prefs_video_vulkan_producer: VulkanFrameProducerKind,
     prefs_default_output_device_id: Option<String>,
     prefs_default_input_device_id: Option<String>,
 }
@@ -583,6 +590,8 @@ fn load_preferences() -> AppPreferences {
         default_export_sample_rate_hz: cfg.default_export_sample_rate_hz,
         default_snap_mode: cfg.default_snap_mode,
         default_audio_bit_depth: cfg.default_audio_bit_depth,
+        default_video_backend: cfg.default_video_backend,
+        default_video_vulkan_producer: cfg.default_video_vulkan_producer,
         default_output_device_id: cfg.default_output_device_id,
         default_input_device_id: cfg.default_input_device_id,
         recent_session_paths: cfg.recent_session_paths,
@@ -742,7 +751,10 @@ impl Default for Maolan {
             video_preview_split_resize_hovered: false,
             video_preview_split_secondary_resize_hovered: false,
             last_video_preview_request: None,
-            video_runtime: crate::video_runtime::VideoRuntime::new(),
+            video_runtime: crate::video_runtime::VideoRuntime::new_with_preferences(
+                prefs.default_video_backend,
+                prefs.default_video_vulkan_producer,
+            ),
             tracks_visible: true,
             editor_visible: true,
             mixer_visible: true,
@@ -839,6 +851,8 @@ impl Default for Maolan {
             prefs_export_sample_rate_hz: prefs.default_export_sample_rate_hz,
             prefs_snap_mode: prefs.default_snap_mode,
             prefs_audio_bit_depth: prefs.default_audio_bit_depth,
+            prefs_video_backend: prefs.default_video_backend,
+            prefs_video_vulkan_producer: prefs.default_video_vulkan_producer,
             prefs_default_output_device_id: prefs.default_output_device_id,
             prefs_default_input_device_id: prefs.default_input_device_id,
         }
@@ -2729,8 +2743,8 @@ impl Maolan {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("video");
-        // Store imported video as Matroska with intra-only frames so scrubbing and
-        // rewind do not depend on inter-frame prediction.
+        // Store imported video as AV1 in Matroska so the session only contains one
+        // video codec family while still keeping a container that FFmpeg handles well.
         let rel = Self::unique_import_rel_path(session_root, "video", stem, "mkv")?;
         let dst = session_root.join(&rel);
         fs::create_dir_all(session_root.join("video"))?;
@@ -2764,6 +2778,7 @@ impl Maolan {
             frame_rate.denominator().max(1),
             frame_rate.numerator().max(1),
         );
+        let input_time_base = input_stream.time_base();
         let decoder_context =
             ffmpeg_next::codec::Context::from_parameters(input_stream.parameters())
                 .map_err(|e| io::Error::other(format!("Video codec params failed: {e}")))?;
@@ -2785,8 +2800,13 @@ impl Maolan {
         )
         .map_err(|e| io::Error::other(format!("Video scaler init failed: {e}")))?;
 
-        let encoder_codec = ffmpeg_next::codec::encoder::find(CodecId::MPEG4)
-            .ok_or_else(|| io::Error::other("MPEG-4 video encoder not found"))?;
+        let encoder_codec = ["libsvtav1", "libaom-av1", "rav1e", "av1"]
+            .into_iter()
+            .find_map(ffmpeg_next::codec::encoder::find_by_name)
+            .or_else(|| ffmpeg_next::codec::encoder::find(CodecId::AV1))
+            .ok_or_else(|| io::Error::other("AV1 video encoder not found"))?;
+        let mut output = output(dst.to_str().unwrap_or("video.mkv"))
+            .map_err(|e| io::Error::other(format!("Failed to create output context: {e}")))?;
         let mut encoder = CodecContext::new_with_codec(encoder_codec)
             .encoder()
             .video()
@@ -2794,24 +2814,28 @@ impl Maolan {
         encoder.set_width(width);
         encoder.set_height(height);
         encoder.set_format(output_pixel_format);
-        encoder.set_time_base(frame_time_base);
+        encoder.set_time_base(input_time_base);
         encoder.set_frame_rate(Some(frame_rate));
-        encoder.set_gop(1);
+        encoder.set_gop(12);
         encoder.set_max_b_frames(0);
         let fps =
             f64::from(frame_rate.numerator().max(1)) / f64::from(frame_rate.denominator().max(1));
         let fallback_bit_rate = (((width as f64) * (height as f64) * fps * 2.0).round() as usize)
-            .clamp(2_000_000, 20_000_000);
+            .clamp(1_500_000, 12_000_000);
         let source_bit_rate = decoder.bit_rate();
         encoder.set_bit_rate(source_bit_rate.max(fallback_bit_rate));
-
-        let mut output = output(dst.to_str().unwrap_or("video.mkv"))
-            .map_err(|e| io::Error::other(format!("Failed to create output context: {e}")))?;
+        if output
+            .format()
+            .flags()
+            .contains(ffmpeg_next::format::flag::Flags::GLOBAL_HEADER)
+        {
+            encoder.set_flags(ffmpeg_next::codec::flag::Flags::GLOBAL_HEADER);
+        }
         let output_stream_index = {
             let mut output_stream = output
                 .add_stream(encoder_codec)
                 .map_err(|e| io::Error::other(format!("Failed to add output stream: {e}")))?;
-            output_stream.set_time_base(frame_time_base);
+            output_stream.set_time_base(input_time_base);
             output_stream.set_rate(frame_rate);
             output_stream.set_avg_frame_rate(frame_rate);
             output_stream.set_parameters(&encoder);
@@ -2821,8 +2845,9 @@ impl Maolan {
         let mut encoder = encoder
             .open_as(encoder_codec)
             .map_err(|e| io::Error::other(format!("Failed to open video encoder: {e}")))?;
+        let encoder_time_base = encoder.time_base();
         if let Some(mut output_stream) = output.stream_mut(output_stream_index) {
-            output_stream.set_time_base(frame_time_base);
+            output_stream.set_time_base(encoder_time_base);
             output_stream.set_rate(frame_rate);
             output_stream.set_avg_frame_rate(frame_rate);
             output_stream.set_parameters(&encoder);
@@ -2833,14 +2858,13 @@ impl Maolan {
 
         output
             .write_header()
-            .map_err(|e| io::Error::other(format!("Failed to write video header: {e}")))?;
+            .map_err(|e| io::Error::other(format!("Failed to write AV1 video header: {e}")))?;
 
         let output_stream_time_base = output
             .stream(output_stream_index)
             .map(|stream| stream.time_base())
             .unwrap_or(frame_time_base);
         let mut decoded = Video::empty();
-        let mut encoded_pts = 0_i64;
         for (packet_stream, packet) in input.packets() {
             if packet_stream.index() != input_index {
                 continue;
@@ -2853,8 +2877,8 @@ impl Maolan {
                 scaler
                     .run(&decoded, &mut encoded_frame)
                     .map_err(|e| io::Error::other(format!("Failed to convert video frame: {e}")))?;
-                encoded_frame.set_pts(Some(encoded_pts));
-                encoded_pts = encoded_pts.saturating_add(1);
+                let frame_pts = decoded.timestamp();
+                encoded_frame.set_pts(frame_pts);
                 encoder
                     .send_frame(&encoded_frame)
                     .map_err(|e| io::Error::other(format!("Failed to send encoded frame: {e}")))?;
@@ -2862,9 +2886,9 @@ impl Maolan {
                 let mut encoded_packet = ffmpeg_next::packet::Packet::empty();
                 while encoder.receive_packet(&mut encoded_packet).is_ok() {
                     encoded_packet.set_stream(output_stream_index);
-                    encoded_packet.rescale_ts(frame_time_base, output_stream_time_base);
+                    encoded_packet.rescale_ts(encoder_time_base, output_stream_time_base);
                     encoded_packet.write_interleaved(&mut output).map_err(|e| {
-                        io::Error::other(format!("Failed to write encoded video packet: {e}"))
+                        io::Error::other(format!("Failed to write encoded AV1 video packet: {e}"))
                     })?;
                 }
             }
@@ -2878,8 +2902,8 @@ impl Maolan {
             scaler
                 .run(&decoded, &mut encoded_frame)
                 .map_err(|e| io::Error::other(format!("Failed to convert video frame: {e}")))?;
-            encoded_frame.set_pts(Some(encoded_pts));
-            encoded_pts = encoded_pts.saturating_add(1);
+            let frame_pts = decoded.timestamp();
+            encoded_frame.set_pts(frame_pts);
             encoder
                 .send_frame(&encoded_frame)
                 .map_err(|e| io::Error::other(format!("Failed to send encoded frame: {e}")))?;
@@ -2887,9 +2911,9 @@ impl Maolan {
             let mut encoded_packet = ffmpeg_next::packet::Packet::empty();
             while encoder.receive_packet(&mut encoded_packet).is_ok() {
                 encoded_packet.set_stream(output_stream_index);
-                encoded_packet.rescale_ts(frame_time_base, output_stream_time_base);
+                encoded_packet.rescale_ts(encoder_time_base, output_stream_time_base);
                 encoded_packet.write_interleaved(&mut output).map_err(|e| {
-                    io::Error::other(format!("Failed to write encoded video packet: {e}"))
+                    io::Error::other(format!("Failed to write encoded AV1 video packet: {e}"))
                 })?;
             }
         }
@@ -2900,15 +2924,15 @@ impl Maolan {
         let mut encoded_packet = ffmpeg_next::packet::Packet::empty();
         while encoder.receive_packet(&mut encoded_packet).is_ok() {
             encoded_packet.set_stream(output_stream_index);
-            encoded_packet.rescale_ts(frame_time_base, output_stream_time_base);
+            encoded_packet.rescale_ts(encoder_time_base, output_stream_time_base);
             encoded_packet.write_interleaved(&mut output).map_err(|e| {
-                io::Error::other(format!("Failed to write encoded video packet: {e}"))
+                io::Error::other(format!("Failed to write encoded AV1 video packet: {e}"))
             })?;
         }
 
         output
             .write_trailer()
-            .map_err(|e| io::Error::other(format!("Failed to finalize video file: {e}")))?;
+            .map_err(|e| io::Error::other(format!("Failed to finalize AV1 video file: {e}")))?;
         Ok(rel)
     }
 
@@ -6547,6 +6571,30 @@ impl Maolan {
                     )
                     .placeholder("Choose output device")
                     .width(Length::Fixed(320.0)),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+                row![
+                    text("Video backend:"),
+                    pick_list(
+                        VideoRuntimeBackendPreference::ALL.to_vec(),
+                        Some(self.prefs_video_backend),
+                        Message::PreferencesVideoBackendSelected
+                    )
+                    .placeholder("Choose backend")
+                    .width(Length::Fixed(220.0)),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+                row![
+                    text("Vulkan producer:"),
+                    pick_list(
+                        VulkanFrameProducerKind::ALL.to_vec(),
+                        Some(self.prefs_video_vulkan_producer),
+                        Message::PreferencesVideoVulkanProducerSelected
+                    )
+                    .placeholder("Choose producer")
+                    .width(Length::Fixed(220.0)),
                 ]
                 .spacing(10)
                 .align_y(iced::Alignment::Center),

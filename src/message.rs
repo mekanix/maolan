@@ -13,6 +13,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::state::AudioBackendOption;
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
 use crate::state::AudioDeviceOption;
+use crate::video_runtime::{types::VideoRuntimeBackendPreference, vulkan::VulkanFrameProducerKind};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy)]
@@ -710,6 +711,8 @@ pub enum Message {
     PreferencesSampleRateSelected(u32),
     PreferencesSnapModeSelected(SnapMode),
     PreferencesBitDepthSelected(usize),
+    PreferencesVideoBackendSelected(VideoRuntimeBackendPreference),
+    PreferencesVideoVulkanProducerSelected(VulkanFrameProducerKind),
     PreferencesOscEnabledToggled(bool),
     PreferencesOutputDeviceSelected(PreferencesDeviceOption),
     PreferencesInputDeviceSelected(PreferencesDeviceOption),

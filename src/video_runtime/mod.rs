@@ -14,7 +14,10 @@ use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
 };
-use types::{VideoFrameDebugInfo, VideoFrameRef, VideoRuntimeBackend};
+use types::{
+    VideoFrameDebugInfo, VideoFrameLoadState, VideoFrameRef, VideoRuntimeBackend,
+    VideoRuntimeBackendPreference,
+};
 
 use self::{
     backend::VideoBackend,
@@ -24,6 +27,7 @@ use self::{
 };
 
 pub struct VideoRuntime {
+    backend_preference: VideoRuntimeBackendPreference,
     active_backend: VideoRuntimeBackend,
     cpu_backend: CpuBackend,
     vulkan_backend: VulkanBackend,
@@ -32,29 +36,48 @@ pub struct VideoRuntime {
 
 impl VideoRuntime {
     pub fn new() -> Self {
-        let active_backend = Self::default_backend_from_env();
+        Self::new_with_preferences(
+            Self::backend_preference_from_env().unwrap_or_default(),
+            Self::default_vulkan_producer_kind_from_env(),
+        )
+    }
+
+    pub fn new_with_preferences(
+        preference: VideoRuntimeBackendPreference,
+        producer_kind: VulkanFrameProducerKind,
+    ) -> Self {
+        let vulkan_backend = Self::default_vulkan_backend(producer_kind);
+        let active_backend =
+            Self::resolve_backend_preference(preference, vulkan_backend.is_available());
         Self {
+            backend_preference: preference,
             active_backend,
             cpu_backend: CpuBackend::new(),
-            vulkan_backend: Self::default_vulkan_backend(),
+            vulkan_backend,
             presenter: VideoPresenter::new(),
         }
     }
 
-    fn default_backend_from_env() -> VideoRuntimeBackend {
-        match std::env::var("MAOLAN_VIDEO_BACKEND")
+    fn backend_preference_from_env() -> Option<VideoRuntimeBackendPreference> {
+        std::env::var("MAOLAN_VIDEO_BACKEND")
             .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("vulkan") => VideoRuntimeBackend::Vulkan,
+            .and_then(|value| value.parse().ok())
+    }
+
+    fn resolve_backend_preference(
+        preference: VideoRuntimeBackendPreference,
+        vulkan_available: bool,
+    ) -> VideoRuntimeBackend {
+        match preference {
+            VideoRuntimeBackendPreference::Auto if vulkan_available => VideoRuntimeBackend::Vulkan,
+            VideoRuntimeBackendPreference::Vulkan if vulkan_available => {
+                VideoRuntimeBackend::Vulkan
+            }
             _ => VideoRuntimeBackend::Cpu,
         }
     }
 
-    fn default_vulkan_backend() -> VulkanBackend {
+    fn default_vulkan_backend(producer_kind: VulkanFrameProducerKind) -> VulkanBackend {
         VulkanBackend::with_producer_kind(
             VulkanRuntimeConfig {
                 device: VulkanDeviceContext {
@@ -64,7 +87,7 @@ impl VideoRuntime {
                 decode_queue_family_index: 0,
                 presentation_queue_family_index: 0,
             },
-            Self::default_vulkan_producer_kind_from_env(),
+            producer_kind,
         )
     }
 
@@ -89,19 +112,53 @@ impl VideoRuntime {
         producer_kind: VulkanFrameProducerKind,
     ) {
         self.vulkan_backend = VulkanBackend::with_producer_kind(config, producer_kind);
-        if self.active_backend == VideoRuntimeBackend::Vulkan {
-            self.active_backend = VideoRuntimeBackend::Vulkan;
-        }
+        self.active_backend = Self::resolve_backend_preference(
+            self.backend_preference,
+            self.vulkan_backend.is_available(),
+        );
     }
 
-    #[allow(dead_code)]
-    pub fn backend(&self) -> Option<VideoRuntimeBackend> {
-        Some(self.active_backend)
+    pub fn backend(&self) -> VideoRuntimeBackend {
+        self.backend_impl().kind()
     }
 
     #[allow(dead_code)]
     pub fn set_backend(&mut self, backend: VideoRuntimeBackend) {
-        self.active_backend = backend;
+        self.active_backend = match backend {
+            VideoRuntimeBackend::Cpu => VideoRuntimeBackend::Cpu,
+            VideoRuntimeBackend::Vulkan if self.vulkan_backend.is_available() => {
+                VideoRuntimeBackend::Vulkan
+            }
+            VideoRuntimeBackend::Vulkan => VideoRuntimeBackend::Cpu,
+        };
+    }
+
+    pub fn backend_preference(&self) -> VideoRuntimeBackendPreference {
+        self.backend_preference
+    }
+
+    #[allow(dead_code)]
+    pub fn set_backend_preference(&mut self, preference: VideoRuntimeBackendPreference) {
+        self.backend_preference = preference;
+        self.active_backend =
+            Self::resolve_backend_preference(preference, self.vulkan_backend.is_available());
+    }
+
+    pub fn vulkan_producer_kind(&self) -> VulkanFrameProducerKind {
+        self.vulkan_backend.producer_kind()
+    }
+
+    pub fn set_preferences(
+        &mut self,
+        backend_preference: VideoRuntimeBackendPreference,
+        producer_kind: VulkanFrameProducerKind,
+    ) {
+        self.backend_preference = backend_preference;
+        self.vulkan_backend = Self::default_vulkan_backend(producer_kind);
+        self.active_backend = Self::resolve_backend_preference(
+            backend_preference,
+            self.vulkan_backend.is_available(),
+        );
     }
 
     pub fn texture_registry(&self) -> Option<Arc<Mutex<VideoTextureRegistry>>> {
@@ -145,7 +202,14 @@ impl VideoRuntime {
         self.backend_impl().current_frame(clip)
     }
 
-    #[allow(dead_code)]
+    pub fn preview_load_state(&self, clip: &VideoClip) -> Option<VideoFrameLoadState> {
+        self.backend_impl().preview_load_state(clip)
+    }
+
+    pub fn current_load_state(&self, clip: &VideoClip) -> Option<VideoFrameLoadState> {
+        self.backend_impl().current_load_state(clip)
+    }
+
     pub fn image_handle(&self, frame: &VideoFrameRef<'_>) -> Option<iced::widget::image::Handle> {
         self.presenter.image_handle(frame)
     }
@@ -188,5 +252,58 @@ impl VideoRuntime {
 impl Default for VideoRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_backend_preference_defaults_to_cpu() {
+        assert_eq!(
+            VideoRuntime::resolve_backend_preference(VideoRuntimeBackendPreference::Cpu, true),
+            VideoRuntimeBackend::Cpu
+        );
+    }
+
+    #[test]
+    fn resolve_backend_preference_uses_auto_when_vulkan_available() {
+        assert_eq!(
+            VideoRuntime::resolve_backend_preference(VideoRuntimeBackendPreference::Auto, true),
+            VideoRuntimeBackend::Vulkan
+        );
+    }
+
+    #[test]
+    fn resolve_backend_preference_auto_falls_back_to_cpu_when_unavailable() {
+        assert_eq!(
+            VideoRuntime::resolve_backend_preference(VideoRuntimeBackendPreference::Auto, false),
+            VideoRuntimeBackend::Cpu
+        );
+    }
+
+    #[test]
+    fn resolve_backend_preference_vulkan_falls_back_to_cpu_when_unavailable() {
+        assert_eq!(
+            VideoRuntime::resolve_backend_preference(VideoRuntimeBackendPreference::Vulkan, false),
+            VideoRuntimeBackend::Cpu
+        );
+    }
+
+    #[test]
+    fn backend_preference_from_env_parses_known_values() {
+        assert_eq!(
+            "auto".parse::<VideoRuntimeBackendPreference>().ok(),
+            Some(VideoRuntimeBackendPreference::Auto)
+        );
+        assert_eq!(
+            "cpu".parse::<VideoRuntimeBackendPreference>().ok(),
+            Some(VideoRuntimeBackendPreference::Cpu)
+        );
+        assert_eq!(
+            "vulkan".parse::<VideoRuntimeBackendPreference>().ok(),
+            Some(VideoRuntimeBackendPreference::Vulkan)
+        );
     }
 }

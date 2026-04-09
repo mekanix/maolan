@@ -104,6 +104,8 @@ impl Maolan {
                 Task::none()
             }
             Show::Preferences => {
+                self.prefs_video_backend = self.video_runtime.backend_preference();
+                self.prefs_video_vulkan_producer = self.video_runtime.vulkan_producer_kind();
                 #[cfg(target_os = "linux")]
                 {
                     let prefs = super::super::super::load_preferences();

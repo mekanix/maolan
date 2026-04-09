@@ -69,6 +69,25 @@ fn widget_midi_clip_data(clip: &crate::state::MIDIClip) -> WidgetMIDIClipData {
     }
 }
 
+fn video_runtime_load_label(
+    video_runtime: &crate::video_runtime::VideoRuntime,
+    video: &crate::state::VideoClip,
+) -> Option<String> {
+    let backend = match video_runtime.backend() {
+        crate::video_runtime::types::VideoRuntimeBackend::Cpu => "CPU",
+        crate::video_runtime::types::VideoRuntimeBackend::Vulkan => "Vulkan",
+    };
+    let state = video_runtime.preview_load_state(video)?;
+    Some(match state {
+        crate::video_runtime::types::VideoFrameLoadState::Loading => {
+            format!("{backend} • loading")
+        }
+        crate::video_runtime::types::VideoFrameLoadState::Failed(err) => {
+            format!("{backend} • {err}")
+        }
+    })
+}
+
 struct TrackElementViewArgs<'a> {
     state: &'a StateData,
     track: &'a Track,
@@ -813,23 +832,15 @@ fn view_track_elements(args: TrackElementViewArgs<'_>) -> Element<'static, Messa
         let frame_element: Element<'static, Message> = if let Some(frame) =
             video_runtime.preview_frame(video)
         {
-            match video_runtime.presentable_frame(&frame) {
-                Some(crate::video_runtime::presenter::PresentableFrame::CpuImage(handle)) => {
-                    image(handle)
-                        .width(Length::Fixed(clip_width))
-                        .height(Length::Fixed(clip_height))
-                        .content_fit(ContentFit::Fill)
-                        .into()
-                }
-                Some(crate::video_runtime::presenter::PresentableFrame::GpuTexture(handle)) => {
-                    if let crate::video_runtime::types::VideoFrameRef::Gpu { metadata, .. } = frame
-                        && let Some(registry) = video_runtime.texture_registry()
-                    {
-                        crate::video_runtime::widget::VideoSurface::new(handle, metadata, registry)
-                            .width(Length::Fixed(clip_width))
-                            .height(Length::Fixed(clip_height))
-                            .into()
-                    } else {
+            if let Some(handle) = video_runtime.image_handle(&frame) {
+                image(handle)
+                    .width(Length::Fixed(clip_width))
+                    .height(Length::Fixed(clip_height))
+                    .content_fit(ContentFit::Fill)
+                    .into()
+            } else {
+                match video_runtime.presentable_frame(&frame) {
+                    Some(crate::video_runtime::presenter::PresentableFrame::CpuImage(_)) => {
                         container(text(label.clone()).size(11))
                             .center_y(Length::Fill)
                             .padding([2, 6])
@@ -849,26 +860,77 @@ fn view_track_elements(args: TrackElementViewArgs<'_>) -> Element<'static, Messa
                             })
                             .into()
                     }
+                    Some(crate::video_runtime::presenter::PresentableFrame::GpuTexture(handle)) => {
+                        if let crate::video_runtime::types::VideoFrameRef::Gpu { metadata, .. } =
+                            frame
+                            && let Some(registry) = video_runtime.texture_registry()
+                        {
+                            crate::video_runtime::widget::VideoSurface::new(
+                                handle, metadata, registry,
+                            )
+                            .width(Length::Fixed(clip_width))
+                            .height(Length::Fixed(clip_height))
+                            .into()
+                        } else {
+                            container(text(label.clone()).size(11))
+                                .center_y(Length::Fill)
+                                .padding([2, 6])
+                                .width(Length::Fixed(clip_width))
+                                .height(Length::Fixed(clip_height))
+                                .style(|_theme| container::Style {
+                                    background: Some(Background::Color(Color::from_rgba(
+                                        0.64, 0.52, 0.12, 0.82,
+                                    ))),
+                                    border: Border {
+                                        color: Color::from_rgba(0.98, 0.90, 0.44, 0.9),
+                                        width: 1.0,
+                                        radius: 6.0.into(),
+                                    },
+                                    text_color: Some(Color::from_rgb(0.14, 0.11, 0.03)),
+                                    ..container::Style::default()
+                                })
+                                .into()
+                        }
+                    }
+                    None => container(text(label.clone()).size(11))
+                        .center_y(Length::Fill)
+                        .padding([2, 6])
+                        .width(Length::Fixed(clip_width))
+                        .height(Length::Fixed(clip_height))
+                        .style(|_theme| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(
+                                0.64, 0.52, 0.12, 0.82,
+                            ))),
+                            border: Border {
+                                color: Color::from_rgba(0.98, 0.90, 0.44, 0.9),
+                                width: 1.0,
+                                radius: 6.0.into(),
+                            },
+                            text_color: Some(Color::from_rgb(0.14, 0.11, 0.03)),
+                            ..container::Style::default()
+                        })
+                        .into(),
                 }
-                None => container(text(label.clone()).size(11))
-                    .center_y(Length::Fill)
-                    .padding([2, 6])
-                    .width(Length::Fixed(clip_width))
-                    .height(Length::Fixed(clip_height))
-                    .style(|_theme| container::Style {
-                        background: Some(Background::Color(Color::from_rgba(
-                            0.64, 0.52, 0.12, 0.82,
-                        ))),
-                        border: Border {
-                            color: Color::from_rgba(0.98, 0.90, 0.44, 0.9),
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        text_color: Some(Color::from_rgb(0.14, 0.11, 0.03)),
-                        ..container::Style::default()
-                    })
-                    .into(),
             }
+        } else if let Some(load_label) = video_runtime_load_label(video_runtime, video) {
+            let text_block =
+                column![text(label.clone()).size(11), text(load_label).size(9)].spacing(4);
+            container(text_block)
+                .center_y(Length::Fill)
+                .padding([2, 6])
+                .width(Length::Fixed(clip_width))
+                .height(Length::Fixed(clip_height))
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color::from_rgba(0.64, 0.52, 0.12, 0.82))),
+                    border: Border {
+                        color: Color::from_rgba(0.98, 0.90, 0.44, 0.9),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    text_color: Some(Color::from_rgb(0.14, 0.11, 0.03)),
+                    ..container::Style::default()
+                })
+                .into()
         } else {
             container(text(label.clone()).size(11))
                 .center_y(Length::Fill)
