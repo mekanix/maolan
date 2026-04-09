@@ -1,16 +1,13 @@
 use crate::message::{
     Action, Message, OfflineAutomationLane, OfflineAutomationPoint, OfflineAutomationTarget,
-    OfflineBounceWork, VideoDecodeJob,
+    OfflineBounceWork,
 };
 use crate::mutex::UnsafeMutex;
 use crate::state::State;
 #[cfg(unix)]
 use nix::libc;
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
+use std::sync::Arc;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::error;
 use wavers::write as write_wav;
 
@@ -19,39 +16,14 @@ pub struct Worker {
     id: usize,
     rx: Receiver<Message>,
     tx: Sender<Message>,
+    #[allow(dead_code)]
     state: Arc<UnsafeMutex<State>>,
+    #[allow(dead_code)]
     clients: Arc<UnsafeMutex<Vec<Sender<Message>>>>,
 }
 
 impl Worker {
-    fn resolve_video_clip_path(path: &str, session_base_dir: Option<&PathBuf>) -> PathBuf {
-        let path = Path::new(path);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else if let Some(base) = session_base_dir {
-            base.join(path)
-        } else {
-            path.to_path_buf()
-        }
-    }
-
-    fn video_clip_matches(
-        current: &Option<crate::message::VideoClipData>,
-        expected: &crate::message::VideoClipData,
-        session_base_dir: Option<&PathBuf>,
-    ) -> bool {
-        current
-            .as_ref()
-            .map(|clip| {
-                Self::resolve_video_clip_path(&clip.path, session_base_dir)
-                    == Self::resolve_video_clip_path(&expected.path, session_base_dir)
-                    && clip.start == expected.start
-                    && clip.length == expected.length
-                    && clip.offset == expected.offset
-            })
-            .unwrap_or(false)
-    }
-
+    #[allow(dead_code)]
     async fn notify_clients(&self, action: Result<Action, String>) {
         let clients = self.clients.lock().clone();
         for client in &clients {
@@ -59,18 +31,6 @@ impl Worker {
                 .send(Message::Response(action.clone()))
                 .await
                 .expect("Error sending response to client from worker");
-        }
-    }
-
-    fn try_notify_clients_video(&self, action: Action) {
-        let clients = self.clients.lock().clone();
-        for client in &clients {
-            match client.try_send(Message::Response(Ok(action.clone()))) {
-                Ok(()) | Err(TrySendError::Closed(_)) => {}
-                Err(TrySendError::Full(_)) => {
-                    // Drop stale frame notifications instead of blocking engine workers/UI.
-                }
-            }
         }
     }
 
@@ -341,171 +301,6 @@ impl Worker {
         let _ = self.tx.send(Message::Ready(self.id)).await;
     }
 
-    async fn process_video_decode(&self, job: VideoDecodeJob) {
-        match job {
-            VideoDecodeJob::Preview {
-                track_name,
-                clip,
-                sample_rate,
-            } => {
-                let result = crate::video::decode_iframe_preview_strip(&clip, sample_rate);
-                match result {
-                    Ok(buffer) => {
-                        let should_publish = {
-                            if let Some(track) = self.state.lock().tracks.get(&track_name).cloned()
-                            {
-                                let track = track.lock();
-                                if Self::video_clip_matches(
-                                    &track.video_clip,
-                                    &clip,
-                                    track.session_base_dir.as_ref(),
-                                ) {
-                                    track.video_frame = Some(buffer.clone());
-                                    true
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        };
-                        if should_publish {
-                            let interval_samples = self
-                                .state
-                                .lock()
-                                .tracks
-                                .get(&track_name)
-                                .map(|track| track.lock().video_frame_interval_samples)
-                                .unwrap_or(1);
-                            self.try_notify_clients_video(Action::TrackVideoFrame {
-                                track_name,
-                                buffer,
-                                clip,
-                                interval_samples,
-                            });
-                        }
-                    }
-                    Err(err) => {
-                        self.notify_clients(Err(err)).await;
-                    }
-                }
-            }
-            VideoDecodeJob::CurrentFrame {
-                track_name,
-                clip,
-                sample_rate: _sample_rate,
-                mut sample,
-                generation,
-            } => loop {
-                let decoder = {
-                    let Some(track) = self.state.lock().tracks.get(&track_name).cloned() else {
-                        break;
-                    };
-                    let track = track.lock();
-                    if track.video_decode_generation != generation
-                        || !Self::video_clip_matches(
-                            &track.video_clip,
-                            &clip,
-                            track.session_base_dir.as_ref(),
-                        )
-                    {
-                        break;
-                    }
-                    track.video_decoder.clone()
-                };
-                let Some(decoder) = decoder else {
-                    self.notify_clients(Err(format!(
-                        "Video decoder unavailable for track '{}'",
-                        track_name
-                    )))
-                    .await;
-                    break;
-                };
-                let result = decoder.lock().decode_frame_at_sample(sample);
-                match result {
-                    Ok(buffer) => {
-                        let next_sample = {
-                            let Some(track) = self.state.lock().tracks.get(&track_name).cloned()
-                            else {
-                                break;
-                            };
-                            let track = track.lock();
-                            if track.video_decode_generation != generation
-                                || !Self::video_clip_matches(
-                                    &track.video_clip,
-                                    &clip,
-                                    track.session_base_dir.as_ref(),
-                                )
-                            {
-                                break;
-                            }
-                            let next = track
-                                .video_pending_sample
-                                .take()
-                                .filter(|pending| *pending != sample);
-                            track.video_current_frame = Some(buffer.clone());
-                            if next.is_none() {
-                                track.video_current_frame_inflight = false;
-                            }
-                            next
-                        };
-
-                        self.try_notify_clients_video(Action::TrackVideoCurrentFrame {
-                            track_name: track_name.clone(),
-                            buffer,
-                            clip: clip.clone(),
-                            interval_samples: self
-                                .state
-                                .lock()
-                                .tracks
-                                .get(&track_name)
-                                .map(|track| track.lock().video_frame_interval_samples)
-                                .unwrap_or(1),
-                        });
-                        if let Some(next_sample) = next_sample {
-                            sample = next_sample;
-                            continue;
-                        }
-                        break;
-                    }
-                    Err(err) => {
-                        let next_sample = {
-                            let Some(track) = self.state.lock().tracks.get(&track_name).cloned()
-                            else {
-                                break;
-                            };
-                            let track = track.lock();
-                            if track.video_decode_generation != generation
-                                || !Self::video_clip_matches(
-                                    &track.video_clip,
-                                    &clip,
-                                    track.session_base_dir.as_ref(),
-                                )
-                            {
-                                break;
-                            }
-                            let next = track.video_pending_sample.take();
-                            if next.is_none() {
-                                track.video_current_frame_inflight = false;
-                            }
-                            next
-                        };
-
-                        if let Some(next_sample) = next_sample {
-                            sample = next_sample;
-                            continue;
-                        }
-
-                        self.notify_clients(Err(err)).await;
-                        break;
-                    }
-                }
-            },
-        }
-
-        let _ = self.tx.send(Message::Ready(self.id)).await;
-    }
-
     #[cfg(unix)]
     fn try_enable_realtime() -> Result<(), String> {
         let thread = unsafe { libc::pthread_self() };
@@ -592,9 +387,6 @@ impl Worker {
                 }
                 Message::ProcessOfflineBounce(job) => {
                     self.process_offline_bounce(job).await;
-                }
-                Message::ProcessVideoDecode(job) => {
-                    self.process_video_decode(job).await;
                 }
                 _ => {}
             }

@@ -26,36 +26,36 @@ impl Video {
         }
     }
 
-    fn frame_is_usable(
-        frame: &std::sync::Arc<
-            maolan_engine::mutex::UnsafeMutex<maolan_engine::message::VideoFrameBuffer>,
-        >,
-    ) -> bool {
-        let frame = frame.lock();
-        frame.width > 0 && frame.height > 0 && !frame.rgba.is_empty()
-    }
-
     fn frame_element(
-        frame: Option<
-            &std::sync::Arc<
-                maolan_engine::mutex::UnsafeMutex<maolan_engine::message::VideoFrameBuffer>,
-            >,
-        >,
+        video_runtime: &crate::video_runtime::VideoRuntime,
+        video: Option<&crate::state::VideoClip>,
         unavailable: &'static str,
         fit: ContentFit,
     ) -> Element<'static, Message> {
-        if let Some(frame) = frame {
-            let frame = frame.lock();
-            if frame.width > 0 && frame.height > 0 && !frame.rgba.is_empty() {
-                return image(image::Handle::from_rgba(
-                    frame.width,
-                    frame.height,
-                    frame.rgba.clone(),
-                ))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .content_fit(fit)
-                .into();
+        if let Some(video) = video
+            && let Some(frame) = video_runtime.current_frame(video)
+        {
+            match video_runtime.presentable_frame(&frame) {
+                Some(crate::video_runtime::presenter::PresentableFrame::CpuImage(handle)) => {
+                    return image(handle)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(fit)
+                        .into();
+                }
+                Some(crate::video_runtime::presenter::PresentableFrame::GpuTexture(handle)) => {
+                    if let crate::video_runtime::types::VideoFrameRef::Gpu { metadata, .. } = frame
+                        && let Some(registry) = video_runtime.texture_registry()
+                    {
+                        return crate::video_runtime::widget::VideoSurface::new(
+                            handle, metadata, registry,
+                        )
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into();
+                    }
+                }
+                None => {}
             }
         }
 
@@ -65,25 +65,6 @@ impl Video {
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into()
-    }
-
-    fn current_or_preview_frame(
-        video: &crate::state::VideoClip,
-    ) -> Option<
-        &std::sync::Arc<
-            maolan_engine::mutex::UnsafeMutex<maolan_engine::message::VideoFrameBuffer>,
-        >,
-    > {
-        video
-            .current_frame
-            .as_ref()
-            .filter(|frame| Self::frame_is_usable(frame))
-            .or_else(|| {
-                video
-                    .frame
-                    .as_ref()
-                    .filter(|frame| Self::frame_is_usable(frame))
-            })
     }
 
     fn session_video_files(session_root: Option<&PathBuf>) -> Vec<String> {
@@ -146,6 +127,7 @@ impl Video {
         session_root: Option<&PathBuf>,
         split_resize_hovered: bool,
         split_secondary_resize_hovered: bool,
+        video_runtime: &crate::video_runtime::VideoRuntime,
     ) -> Element<'_, Message> {
         let state = self.state.blocking_read();
         let selected_name = state.selected.iter().next().cloned();
@@ -201,7 +183,8 @@ impl Video {
                 .on_exit(Message::VideoPreviewSplitSecondaryResizeHover(false))
                 .on_press(Message::VideoPreviewSplitSecondaryResizeStart),
                 container(Self::frame_element(
-                    Self::current_or_preview_frame(selected_video),
+                    video_runtime,
+                    Some(selected_video),
                     "Selected video preview unavailable",
                     ContentFit::Fill,
                 ))
@@ -292,7 +275,8 @@ impl Video {
                     .on_exit(Message::VideoPreviewSplitSecondaryResizeHover(false))
                     .on_press(Message::VideoPreviewSplitSecondaryResizeStart),
                     container(Self::frame_element(
-                        Self::current_or_preview_frame(video),
+                        video_runtime,
+                        Some(video),
                         "Video player unavailable",
                         ContentFit::Contain,
                     ))

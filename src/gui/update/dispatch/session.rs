@@ -179,6 +179,13 @@ impl Maolan {
                 }
                 Task::none()
             }
+            Message::VideoRuntimeDecodeFinished {
+                clip_key,
+                preview,
+                generation,
+            } => self
+                .video_runtime
+                .finish_decode(clip_key, preview, generation),
             _ => Task::none(),
         }
     }

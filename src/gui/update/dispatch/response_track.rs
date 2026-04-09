@@ -175,51 +175,6 @@ impl Maolan {
                 }
                 true
             }
-            Action::TrackVideoFrame {
-                track_name,
-                buffer,
-                clip,
-                interval_samples,
-            } => {
-                let mut state = self.state.blocking_write();
-                if let Some(track) = state.tracks.iter_mut().find(|t| t.name == *track_name) {
-                    track.has_video = true;
-                    track.video = Some(crate::state::VideoClip {
-                        path: clip.path.clone(),
-                        start: clip.start,
-                        length: clip.length,
-                        offset: clip.offset,
-                        frame_interval_samples: *interval_samples,
-                        frame: Some(buffer.clone()),
-                        current_frame: track
-                            .video
-                            .as_ref()
-                            .and_then(|video| video.current_frame.clone()),
-                    });
-                }
-                true
-            }
-            Action::TrackVideoCurrentFrame {
-                track_name,
-                buffer,
-                clip,
-                interval_samples,
-            } => {
-                let mut state = self.state.blocking_write();
-                if let Some(track) = state.tracks.iter_mut().find(|t| t.name == *track_name) {
-                    track.has_video = true;
-                    track.video = Some(crate::state::VideoClip {
-                        path: clip.path.clone(),
-                        start: clip.start,
-                        length: clip.length,
-                        offset: clip.offset,
-                        frame_interval_samples: *interval_samples,
-                        frame: track.video.as_ref().and_then(|video| video.frame.clone()),
-                        current_frame: Some(buffer.clone()),
-                    });
-                }
-                true
-            }
             Action::TrackAddAudioOutput(name) => {
                 let mut state = self.state.blocking_write();
                 if let Some(track) = state.tracks.iter_mut().find(|t| t.name == *name) {

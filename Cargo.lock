@@ -4690,6 +4690,7 @@ dependencies = [
  "iced_aw",
  "iced_drop",
  "iced_fonts",
+ "iced_wgpu",
  "libloading 0.8.9",
  "lilv",
  "maolan-engine",

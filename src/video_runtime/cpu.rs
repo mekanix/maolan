@@ -1,13 +1,24 @@
-use crate::{
-    message::{VideoClipData, VideoFrameBuffer},
-    mutex::UnsafeMutex,
-};
 use ffmpeg_next::{
     Rational, codec, format, frame, media,
     software::scaling::{context::Context as ScalingContext, flag::Flags},
     util::format::pixel::Pixel,
 };
+use maolan_engine::{
+    message::{VideoClipData, VideoFrameBuffer},
+    mutex::UnsafeMutex,
+};
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
+
+use crate::{
+    message::Message,
+    state::VideoClip,
+    video_runtime::{
+        backend::VideoBackend,
+        types::{VideoFrameRef, VideoRuntimeBackend},
+    },
+};
+use iced::Task;
 
 const PREVIEW_THUMB_HEIGHT: u32 = 48;
 const PREVIEW_MAX_THUMBS: usize = 8;
@@ -334,4 +345,94 @@ pub fn estimate_frame_interval_samples(
     };
     let fps = f64::from(rate.numerator().max(1)) / f64::from(rate.denominator().max(1));
     Ok((sample_rate.max(1.0) / fps.max(1.0)).round().max(1.0) as usize)
+}
+
+#[derive(Debug, Default)]
+pub struct CpuBackend;
+
+impl CpuBackend {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn frame_is_usable(frame: &Arc<UnsafeMutex<VideoFrameBuffer>>) -> bool {
+        let frame = frame.lock();
+        frame.width > 0 && frame.height > 0 && !frame.rgba.is_empty()
+    }
+}
+
+impl VideoBackend for CpuBackend {
+    fn kind(&self) -> VideoRuntimeBackend {
+        VideoRuntimeBackend::Cpu
+    }
+
+    fn preview_frame<'a>(&self, clip: &'a VideoClip) -> Option<VideoFrameRef<'a>> {
+        clip.frame
+            .as_ref()
+            .filter(|frame| Self::frame_is_usable(frame))
+            .map(VideoFrameRef::Cpu)
+    }
+
+    fn current_frame<'a>(&self, clip: &'a VideoClip) -> Option<VideoFrameRef<'a>> {
+        clip.current_frame
+            .as_ref()
+            .filter(|frame| Self::frame_is_usable(frame))
+            .or_else(|| {
+                clip.frame
+                    .as_ref()
+                    .filter(|frame| Self::frame_is_usable(frame))
+            })
+            .map(VideoFrameRef::Cpu)
+    }
+
+    fn request_preview_frame(
+        &self,
+        track_name: String,
+        clip: VideoClipData,
+        sample_rate: f64,
+    ) -> Task<Message> {
+        Task::perform(
+            async move {
+                let interval_samples = estimate_frame_interval_samples(&clip, sample_rate)
+                    .unwrap_or_else(|_| sample_rate.max(1.0).round().max(1.0) as usize);
+                let result = decode_iframe_preview_strip(&clip, sample_rate);
+                Message::VideoPreviewFrameLoaded {
+                    track_name,
+                    clip,
+                    interval_samples,
+                    result,
+                }
+            },
+            std::convert::identity,
+        )
+    }
+
+    fn request_current_frame(
+        &self,
+        track_name: String,
+        clip: VideoClipData,
+        sample_rate: f64,
+        sample: usize,
+    ) -> Task<Message> {
+        Task::perform(
+            async move {
+                let interval_samples = estimate_frame_interval_samples(&clip, sample_rate)
+                    .unwrap_or_else(|_| sample_rate.max(1.0).round().max(1.0) as usize);
+                let result = decode_frame_at_sample(&clip, sample_rate, sample);
+                Message::VideoCurrentFrameLoaded {
+                    track_name,
+                    clip,
+                    interval_samples,
+                    result,
+                }
+            },
+            std::convert::identity,
+        )
+    }
+
+    fn finish_decode(&self, _clip_key: String, _preview: bool, _generation: u64) -> Task<Message> {
+        Task::none()
+    }
+
+    fn retain_clip_keys(&self, _clip_keys: &HashSet<String>) {}
 }

@@ -13,7 +13,6 @@ mod routing;
 mod rubberband;
 pub mod state;
 mod track;
-pub mod video;
 pub mod workers;
 pub use workers::worker;
 

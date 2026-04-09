@@ -216,6 +216,7 @@ pub mod workspace_mixer {
 }
 
 pub mod workspace_editor {
+    #[allow(dead_code)]
     pub const CHECKPOINTS: usize = 16;
 }
 

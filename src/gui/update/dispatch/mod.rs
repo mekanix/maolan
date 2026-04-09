@@ -29,6 +29,21 @@ struct MoveClipSnapArgs<'a> {
 }
 
 impl Maolan {
+    fn video_clip_matches_runtime_result(
+        &self,
+        video: &crate::state::VideoClip,
+        clip: &maolan_engine::message::VideoClipData,
+    ) -> bool {
+        let current_path = self.session_dir.as_ref().map_or_else(
+            || std::path::PathBuf::from(&video.path),
+            |session_root| Self::resolve_session_media_path(session_root, &video.path),
+        );
+        current_path == std::path::Path::new(&clip.path)
+            && video.start == clip.start
+            && video.length == clip.length
+            && video.offset == clip.offset
+    }
+
     fn active_workspace_cursor(&self) -> Point {
         let state = self.state.blocking_read();
         state.editor_cursor.unwrap_or(state.cursor)
@@ -47,8 +62,10 @@ impl Maolan {
         force: bool,
     ) -> Option<Task<Message>> {
         let (
+            clip_keys,
             view_is_video,
             track_name,
+            clip,
             needs_preview_frame,
             needs_current_frame,
             min_sample_delta,
@@ -56,6 +73,24 @@ impl Maolan {
         ) = {
             let state = self.state.blocking_read();
             let selected_name = state.selected.iter().next().cloned();
+            let clip_keys = state
+                .tracks
+                .iter()
+                .filter_map(|track| track.video.as_ref())
+                .map(|video| {
+                    let path = self.session_dir.as_ref().map_or_else(
+                        || std::path::PathBuf::from(&video.path),
+                        |session_root| Self::resolve_session_media_path(session_root, &video.path),
+                    );
+                    format!(
+                        "{}:{}:{}:{}",
+                        path.to_string_lossy(),
+                        video.start,
+                        video.length,
+                        video.offset
+                    )
+                })
+                .collect::<std::collections::HashSet<_>>();
             let track = selected_name
                 .as_ref()
                 .and_then(|name| {
@@ -66,6 +101,20 @@ impl Maolan {
                 })
                 .or_else(|| state.tracks.iter().find(|track| track.video.is_some()));
             let track_name = track.map(|track| track.name.clone());
+            let clip = track.and_then(|track| {
+                track.video.as_ref().map(|video| {
+                    let path = self.session_dir.as_ref().map_or_else(
+                        || std::path::PathBuf::from(&video.path),
+                        |session_root| Self::resolve_session_media_path(session_root, &video.path),
+                    );
+                    maolan_engine::message::VideoClipData {
+                        path: path.to_string_lossy().to_string(),
+                        start: video.start,
+                        length: video.length,
+                        offset: video.offset,
+                    }
+                })
+            });
             let needs_preview_frame = track
                 .and_then(|track| track.video.as_ref())
                 .is_some_and(|video| video.frame.is_none());
@@ -79,19 +128,26 @@ impl Maolan {
             let min_request_interval =
                 Duration::from_secs_f64(min_sample_delta as f64 / self.playback_rate_hz.max(1.0));
             (
+                clip_keys,
                 matches!(state.view, View::Video) || state.video_preview_visible,
                 track_name,
+                clip,
                 needs_preview_frame,
                 needs_current_frame,
                 min_sample_delta,
                 min_request_interval,
             )
         };
+        self.video_runtime.retain_clip_keys(&clip_keys);
         if !view_is_video {
             return None;
         }
 
         let Some(track_name) = track_name else {
+            self.last_video_preview_request = None;
+            return None;
+        };
+        let Some(clip) = clip else {
             self.last_video_preview_request = None;
             return None;
         };
@@ -109,13 +165,21 @@ impl Maolan {
 
         self.last_video_preview_request = Some((track_name.clone(), sample, now));
         let mut tasks = Vec::new();
+        let sample_rate = self.playback_rate_hz.max(1.0);
         if force || needs_preview_frame {
-            tasks.push(self.send(Action::RequestTrackVideoFrame {
-                track_name: track_name.clone(),
-            }));
+            tasks.push(self.video_runtime.request_preview_frame(
+                track_name.clone(),
+                clip.clone(),
+                sample_rate,
+            ));
         }
         if force || needs_current_frame || view_is_video {
-            tasks.push(self.send(Action::RequestTrackVideoCurrentFrame { track_name, sample }));
+            tasks.push(self.video_runtime.request_current_frame(
+                track_name,
+                clip,
+                sample_rate,
+                sample,
+            ));
         }
         if tasks.is_empty() {
             None
@@ -413,7 +477,10 @@ impl Maolan {
             | Message::NewFromTemplate(_)
             | Message::NewSession
             | Message::Request(_)
-            | Message::MeterPollTick => return self.handle_session_message(message),
+            | Message::MeterPollTick
+            | Message::VideoRuntimeDecodeFinished { .. } => {
+                return self.handle_session_message(message);
+            }
             Message::EscapePressed => {
                 if matches!(self.modal, Some(Show::AddTrack)) {
                     self.modal = None;
@@ -8504,6 +8571,48 @@ impl Maolan {
                 let key = Self::audio_clip_key(track_name, clip_name, start, length, offset);
                 self.pending_precomputed_peaks.insert(key, peaks.clone());
             }
+            Message::VideoPreviewFrameLoaded {
+                ref track_name,
+                ref clip,
+                interval_samples,
+                ref result,
+            } => match result {
+                Ok(buffer) => {
+                    let mut state = self.state.blocking_write();
+                    if let Some(track) = state.tracks.iter_mut().find(|t| t.name == *track_name)
+                        && let Some(video) = track.video.as_mut()
+                        && self.video_clip_matches_runtime_result(video, clip)
+                    {
+                        video.frame_interval_samples = interval_samples.max(1);
+                        video.frame = Some(buffer.clone());
+                    }
+                }
+                Err(err) => {
+                    self.state.blocking_write().message =
+                        format!("Video preview decode failed for '{}': {err}", track_name);
+                }
+            },
+            Message::VideoCurrentFrameLoaded {
+                ref track_name,
+                ref clip,
+                interval_samples,
+                ref result,
+            } => match result {
+                Ok(buffer) => {
+                    let mut state = self.state.blocking_write();
+                    if let Some(track) = state.tracks.iter_mut().find(|t| t.name == *track_name)
+                        && let Some(video) = track.video.as_mut()
+                        && self.video_clip_matches_runtime_result(video, clip)
+                    {
+                        video.frame_interval_samples = interval_samples.max(1);
+                        video.current_frame = Some(buffer.clone());
+                    }
+                }
+                Err(err) => {
+                    self.state.blocking_write().message =
+                        format!("Video frame decode failed for '{}': {err}", track_name);
+                }
+            },
             Message::TrackTemplatesLoaded(ref templates) => {
                 self.add_track.set_available_templates(templates.clone());
             }

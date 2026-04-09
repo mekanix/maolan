@@ -14,7 +14,7 @@ use crate::mutex::UnsafeMutex;
 use crate::vst3::Vst3Processor;
 use crate::{
     audio::io::AudioIO,
-    message::{VideoClipData, VideoFrameBuffer},
+    message::VideoClipData,
     midi::io::{MIDIIO, MidiEvent},
     rubberband::LivePitchShifter,
 };
@@ -488,14 +488,6 @@ pub struct Track {
     pub record_tap_outs: Vec<Vec<f32>>,
     pub record_tap_midi_in: Vec<MidiEvent>,
     pub video_clip: Option<VideoClipData>,
-    pub video_frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
-    pub video_current_frame: Option<Arc<UnsafeMutex<VideoFrameBuffer>>>,
-    pub video_decoder: Option<Arc<UnsafeMutex<crate::video::VideoDecoderState>>>,
-    pub video_frame_interval_samples: usize,
-    pub video_last_push_sample: Option<usize>,
-    pub video_current_frame_inflight: bool,
-    pub video_pending_sample: Option<usize>,
-    pub video_decode_generation: u64,
     #[cfg(all(unix, not(target_os = "macos")))]
     pub lv2_state_base_dir: Option<PathBuf>,
     pub session_base_dir: Option<PathBuf>,
@@ -579,14 +571,6 @@ impl Track {
             record_tap_outs: vec![vec![0.0; buffer_size]; audio_outs],
             record_tap_midi_in: vec![],
             video_clip: None,
-            video_frame: None,
-            video_current_frame: None,
-            video_decoder: None,
-            video_frame_interval_samples: sample_rate.max(1.0).round() as usize,
-            video_last_push_sample: None,
-            video_current_frame_inflight: false,
-            video_pending_sample: None,
-            video_decode_generation: 0,
             #[cfg(all(unix, not(target_os = "macos")))]
             lv2_state_base_dir: None,
             session_base_dir: None,

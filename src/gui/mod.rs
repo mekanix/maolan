@@ -6,6 +6,7 @@ mod view;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::plugins::lv2::GuiLv2UiHost;
+use crate::video_runtime::cpu::VideoDecoderState;
 use crate::{
     add_track, clip_rename, config, connections,
     consts::audio_defaults,
@@ -58,7 +59,6 @@ use iced::{
 use maolan_engine::{
     kind::Kind,
     message::{Action, Message as EngineMessage, VideoClipData, VideoFrameBuffer},
-    video::VideoDecoderState,
 };
 use maolan_widgets::numeric_input::{number_input, number_input_f32};
 use midly::{
@@ -477,6 +477,7 @@ pub struct Maolan {
     video_preview_split_resize_hovered: bool,
     video_preview_split_secondary_resize_hovered: bool,
     last_video_preview_request: Option<(String, usize, Instant)>,
+    video_runtime: crate::video_runtime::VideoRuntime,
     tracks_visible: bool,
     editor_visible: bool,
     mixer_visible: bool,
@@ -741,6 +742,7 @@ impl Default for Maolan {
             video_preview_split_resize_hovered: false,
             video_preview_split_secondary_resize_hovered: false,
             last_video_preview_request: None,
+            video_runtime: crate::video_runtime::VideoRuntime::new(),
             tracks_visible: true,
             editor_visible: true,
             mixer_visible: true,

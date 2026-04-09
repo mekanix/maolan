@@ -73,6 +73,7 @@ struct TrackElementViewArgs<'a> {
     state: &'a StateData,
     track: &'a Track,
     session_root: Option<&'a PathBuf>,
+    video_runtime: &'a crate::video_runtime::VideoRuntime,
     pixels_per_sample: f32,
     samples_per_bar: f32,
     snap_mode: SnapMode,
@@ -314,6 +315,7 @@ fn view_track_elements(args: TrackElementViewArgs<'_>) -> Element<'static, Messa
         state,
         track,
         session_root,
+        video_runtime,
         pixels_per_sample,
         samples_per_bar,
         snap_mode,
@@ -808,20 +810,47 @@ fn view_track_elements(args: TrackElementViewArgs<'_>) -> Element<'static, Messa
             .and_then(|name| name.to_str())
             .unwrap_or(video.path.as_str())
             .to_string();
-        let frame_element: Element<'static, Message> = if let Some(frame) = &video.frame {
-            let frame = frame.lock();
-            if frame.width > 0 && frame.height > 0 && !frame.rgba.is_empty() {
-                image(image::Handle::from_rgba(
-                    frame.width,
-                    frame.height,
-                    frame.rgba.clone(),
-                ))
-                .width(Length::Fixed(clip_width))
-                .height(Length::Fixed(clip_height))
-                .content_fit(ContentFit::Fill)
-                .into()
-            } else {
-                container(text(label.clone()).size(11))
+        let frame_element: Element<'static, Message> = if let Some(frame) =
+            video_runtime.preview_frame(video)
+        {
+            match video_runtime.presentable_frame(&frame) {
+                Some(crate::video_runtime::presenter::PresentableFrame::CpuImage(handle)) => {
+                    image(handle)
+                        .width(Length::Fixed(clip_width))
+                        .height(Length::Fixed(clip_height))
+                        .content_fit(ContentFit::Fill)
+                        .into()
+                }
+                Some(crate::video_runtime::presenter::PresentableFrame::GpuTexture(handle)) => {
+                    if let crate::video_runtime::types::VideoFrameRef::Gpu { metadata, .. } = frame
+                        && let Some(registry) = video_runtime.texture_registry()
+                    {
+                        crate::video_runtime::widget::VideoSurface::new(handle, metadata, registry)
+                            .width(Length::Fixed(clip_width))
+                            .height(Length::Fixed(clip_height))
+                            .into()
+                    } else {
+                        container(text(label.clone()).size(11))
+                            .center_y(Length::Fill)
+                            .padding([2, 6])
+                            .width(Length::Fixed(clip_width))
+                            .height(Length::Fixed(clip_height))
+                            .style(|_theme| container::Style {
+                                background: Some(Background::Color(Color::from_rgba(
+                                    0.64, 0.52, 0.12, 0.82,
+                                ))),
+                                border: Border {
+                                    color: Color::from_rgba(0.98, 0.90, 0.44, 0.9),
+                                    width: 1.0,
+                                    radius: 6.0.into(),
+                                },
+                                text_color: Some(Color::from_rgb(0.14, 0.11, 0.03)),
+                                ..container::Style::default()
+                            })
+                            .into()
+                    }
+                }
+                None => container(text(label.clone()).size(11))
                     .center_y(Length::Fill)
                     .padding([2, 6])
                     .width(Length::Fixed(clip_width))
@@ -838,7 +867,7 @@ fn view_track_elements(args: TrackElementViewArgs<'_>) -> Element<'static, Messa
                         text_color: Some(Color::from_rgb(0.14, 0.11, 0.03)),
                         ..container::Style::default()
                     })
-                    .into()
+                    .into(),
             }
         } else {
             container(text(label.clone()).size(11))
@@ -1537,6 +1566,7 @@ pub struct Editor {
 
 pub struct EditorViewArgs<'a> {
     pub session_root: Option<&'a PathBuf>,
+    pub video_runtime: &'a crate::video_runtime::VideoRuntime,
     pub pixels_per_sample: f32,
     pub samples_per_bar: f32,
     pub snap_mode: SnapMode,
@@ -1552,29 +1582,12 @@ pub struct EditorViewArgs<'a> {
     pub visible_track_window: VisibleTrackWindow,
 }
 
-#[derive(Clone)]
-pub struct OwnedEditorViewArgs {
-    pub session_root: Option<PathBuf>,
-    pub pixels_per_sample: f32,
-    pub samples_per_bar: f32,
-    pub snap_mode: SnapMode,
-    pub samples_per_beat: f64,
-    pub active_clip_drag: Option<DraggedClip>,
-    pub active_target_track: Option<String>,
-    pub active_target_valid: bool,
-    pub active_clip_snap_adjust_samples: f32,
-    pub active_clip_snap_targets: Vec<crate::state::ClipId>,
-    pub recording_preview_bounds: Option<(usize, usize)>,
-    pub recording_preview_peaks: Option<HashMap<String, ClipPeaks>>,
-    pub midi_clip_previews: Option<MidiClipPreviewMap>,
-    pub visible_track_window: VisibleTrackWindow,
-}
-
 impl Editor {
     pub fn new(state: State) -> Self {
         Self { state }
     }
 
+    #[allow(dead_code)]
     pub fn render_hash(&self, args: &EditorViewArgs<'_>) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         let state = self.state.blocking_read();
@@ -1785,9 +1798,10 @@ impl Editor {
         hasher.finish()
     }
 
-    pub fn into_view_owned(self, args: OwnedEditorViewArgs) -> Element<'static, Message> {
-        let OwnedEditorViewArgs {
+    pub fn view(&self, args: EditorViewArgs<'_>) -> Element<'static, Message> {
+        let EditorViewArgs {
             session_root,
+            video_runtime,
             pixels_per_sample,
             samples_per_bar,
             snap_mode,
@@ -1802,19 +1816,13 @@ impl Editor {
             midi_clip_previews,
             visible_track_window,
         } = args;
-        let state_handle = self.state;
-        let session_root_ref = session_root.as_ref();
-        let active_clip_drag_ref = active_clip_drag.as_ref();
-        let active_target_track_ref = active_target_track.as_deref();
-        let recording_preview_peaks_ref = recording_preview_peaks.as_ref();
-        let midi_clip_previews_ref = midi_clip_previews.as_ref();
 
         let mut result = column![];
         if visible_track_window.top_padding > 0.0 {
             result =
                 result.push(Space::new().height(Length::Fixed(visible_track_window.top_padding)));
         }
-        let state = state_handle.blocking_read();
+        let state = self.state.blocking_read();
         for track in state
             .tracks
             .iter()
@@ -1829,19 +1837,20 @@ impl Editor {
             result = result.push(view_track_elements(TrackElementViewArgs {
                 state: &state,
                 track,
-                session_root: session_root_ref,
+                session_root,
+                video_runtime,
                 pixels_per_sample,
                 samples_per_bar,
                 snap_mode,
                 samples_per_beat,
-                active_clip_drag: active_clip_drag_ref,
-                active_target_track: active_target_track_ref,
+                active_clip_drag,
+                active_target_track,
                 active_target_valid,
                 active_clip_snap_adjust_samples,
-                active_clip_snap_targets: &active_clip_snap_targets,
+                active_clip_snap_targets,
                 recording_preview_bounds,
-                recording_preview_peaks: recording_preview_peaks_ref,
-                midi_clip_previews: midi_clip_previews_ref,
+                recording_preview_peaks,
+                midi_clip_previews,
             }));
         }
         if visible_track_window.bottom_padding > 0.0 {

@@ -49,7 +49,7 @@ use crate::{
     history::{History, UndoEntry, create_inverse_actions, should_record},
     hw::{config, traits::HwDevice},
     kind::Kind,
-    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData, VideoClipData},
+    message::{Action, HwMidiEvent, Message, MidiControllerData, MidiNoteData},
     midi::clip::MIDIClip,
     midi::io::MidiEvent,
     mutex::UnsafeMutex,
@@ -57,7 +57,6 @@ use crate::{
     routing,
     state::State,
     track::Track,
-    video,
     workers::worker::Worker,
 };
 
@@ -249,169 +248,6 @@ impl Engine {
     const MIDI_CC_ALL_SOUND_OFF: u8 = 120;
     const MIDI_CC_ALL_NOTES_OFF: u8 = 123;
     const MIDI_CC_SUSTAIN_PEDAL: u8 = 64;
-
-    fn resolve_video_clip_data(&self, clip: &VideoClipData) -> VideoClipData {
-        let clip_path = std::path::Path::new(&clip.path);
-        if clip_path.is_absolute() {
-            return clip.clone();
-        }
-
-        let resolved = self
-            .session_dir
-            .as_ref()
-            .map(|base| base.join(clip_path))
-            .filter(|candidate| candidate.exists())
-            .or_else(|| {
-                let cwd_candidate = clip_path.to_path_buf();
-                cwd_candidate.exists().then_some(cwd_candidate)
-            })
-            .or_else(|| self.session_dir.as_ref().map(|base| base.join(clip_path)))
-            .unwrap_or_else(|| clip_path.to_path_buf());
-
-        let mut resolved_clip = clip.clone();
-        resolved_clip.path = resolved.to_string_lossy().into_owned();
-        resolved_clip
-    }
-
-    async fn request_track_video_frame(&mut self, track_name: &str) {
-        let Some(track_handle) = self.state.lock().tracks.get(track_name).cloned() else {
-            return;
-        };
-        let (clip, sample_rate) = {
-            let track = track_handle.lock();
-            let Some(clip) = track.video_clip.clone() else {
-                return;
-            };
-            (clip, track.sample_rate)
-        };
-        let clip = self.resolve_video_clip_data(&clip);
-        let Some(worker_index) = self.take_ready_worker_index() else {
-            self.pending_requests
-                .push_back(Action::RequestTrackVideoFrame {
-                    track_name: track_name.to_string(),
-                });
-            return;
-        };
-        let worker = &self.workers[worker_index];
-        if let Err(e) = worker
-            .tx
-            .send(Message::ProcessVideoDecode(
-                crate::message::VideoDecodeJob::Preview {
-                    track_name: track_name.to_string(),
-                    clip,
-                    sample_rate,
-                },
-            ))
-            .await
-        {
-            self.notify_clients(Err(format!("Failed to schedule video preview decode: {e}")))
-                .await;
-        }
-    }
-
-    async fn request_track_video_current_frame(&mut self, track_name: &str, sample: usize) {
-        let Some(track_handle) = self.state.lock().tracks.get(track_name).cloned() else {
-            return;
-        };
-        let (clip, sample_rate, generation) = {
-            let track = track_handle.lock();
-            let Some(clip) = track.video_clip.clone() else {
-                return;
-            };
-            if track.video_current_frame_inflight {
-                track.video_pending_sample = Some(sample);
-                return;
-            }
-            (clip, track.sample_rate, track.video_decode_generation)
-        };
-        let clip = self.resolve_video_clip_data(&clip);
-        {
-            let track = track_handle.lock();
-            if track.video_decoder.is_none() {
-                match video::VideoDecoderState::new(clip.clone(), sample_rate) {
-                    Ok(decoder) => {
-                        track.video_decoder = Some(Arc::new(UnsafeMutex::new(decoder)));
-                    }
-                    Err(err) => {
-                        self.notify_clients(Err(format!(
-                            "Failed to initialize video decoder for '{}': {err}",
-                            track_name
-                        )))
-                        .await;
-                        return;
-                    }
-                }
-            }
-        }
-        let Some(worker_index) = self.take_ready_worker_index() else {
-            track_handle.lock().video_pending_sample = Some(sample);
-            return;
-        };
-        {
-            let track = track_handle.lock();
-            track.video_current_frame_inflight = true;
-            track.video_pending_sample = None;
-        }
-        let worker = &self.workers[worker_index];
-        if let Err(e) = worker
-            .tx
-            .send(Message::ProcessVideoDecode(
-                crate::message::VideoDecodeJob::CurrentFrame {
-                    track_name: track_name.to_string(),
-                    clip,
-                    sample_rate,
-                    sample,
-                    generation,
-                },
-            ))
-            .await
-        {
-            let track = track_handle.lock();
-            track.video_current_frame_inflight = false;
-            track.video_pending_sample = Some(sample);
-            self.notify_clients(Err(format!(
-                "Failed to schedule current video frame decode: {e}"
-            )))
-            .await;
-        }
-    }
-
-    async fn schedule_pending_video_decode_work(&mut self) {
-        while !self.ready_workers.is_empty() {
-            let pending_current = {
-                self.state.lock().tracks.iter().find_map(|(name, track)| {
-                    let track = track.lock();
-                    (!track.video_current_frame_inflight)
-                        .then_some(
-                            track
-                                .video_pending_sample
-                                .map(|sample| (name.clone(), sample)),
-                        )
-                        .flatten()
-                })
-            };
-
-            if let Some((track_name, sample)) = pending_current {
-                self.request_track_video_current_frame(&track_name, sample)
-                    .await;
-                continue;
-            }
-
-            let pending_preview_index = self
-                .pending_requests
-                .iter()
-                .position(|action| matches!(action, Action::RequestTrackVideoFrame { .. }));
-            let Some(pending_preview_index) = pending_preview_index else {
-                break;
-            };
-            let Some(Action::RequestTrackVideoFrame { track_name }) =
-                self.pending_requests.remove(pending_preview_index)
-            else {
-                continue;
-            };
-            self.request_track_video_frame(&track_name).await;
-        }
-    }
 
     fn default_clip_plugin_graph_json(audio_ins: usize, audio_outs: usize) -> serde_json::Value {
         let connections = (0..audio_ins.min(audio_outs))
@@ -4256,34 +4092,6 @@ impl Engine {
             }
             Action::TrackMeters { .. } => {}
             Action::MeterSnapshot { .. } => {}
-            Action::TrackVideoFrame {
-                ref track_name,
-                ref buffer,
-                ..
-            } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name) {
-                    track.lock().video_frame = Some(buffer.clone());
-                }
-            }
-            Action::TrackVideoCurrentFrame {
-                ref track_name,
-                ref buffer,
-                ..
-            } => {
-                if let Some(track) = self.state.lock().tracks.get(track_name) {
-                    track.lock().video_current_frame = Some(buffer.clone());
-                }
-            }
-            Action::RequestTrackVideoFrame { ref track_name } => {
-                self.request_track_video_frame(track_name).await;
-            }
-            Action::RequestTrackVideoCurrentFrame {
-                ref track_name,
-                sample,
-            } => {
-                self.request_track_video_current_frame(track_name, sample)
-                    .await;
-            }
             Action::TrackToggleArm(ref name) => {
                 if self.reject_if_track_frozen(name, "arming/disarming").await {
                     return;
@@ -5690,23 +5498,6 @@ impl Engine {
                 let track = track.lock();
                 track.video_clip = clip.clone();
                 track.has_video = track.has_video || clip.is_some();
-                track.video_frame = None;
-                track.video_current_frame = None;
-                track.video_decoder = None;
-                track.video_last_push_sample = None;
-                track.video_current_frame_inflight = false;
-                track.video_pending_sample = None;
-                track.video_decode_generation = track.video_decode_generation.wrapping_add(1);
-                track.video_frame_interval_samples = clip
-                    .as_ref()
-                    .map(|clip| self.resolve_video_clip_data(clip))
-                    .and_then(|clip| {
-                        video::estimate_frame_interval_samples(&clip, track.sample_rate).ok()
-                    })
-                    .unwrap_or_else(|| track.sample_rate.max(1.0).round() as usize);
-                if clip.is_some() {
-                    self.request_track_video_frame(track_name).await;
-                }
             }
             Action::RemoveClip {
                 ref track_name,
@@ -6505,7 +6296,6 @@ impl Engine {
             match message {
                 Message::Ready(id) => {
                     self.ready_workers.push(id);
-                    self.schedule_pending_video_decode_work().await;
                 }
                 Message::Finished {
                     worker_id,
@@ -6564,9 +6354,6 @@ impl Engine {
                         }
                         self.request_hw_cycle().await;
                     }
-                }
-                Message::VideoDecodeFinished { worker_id, .. } => {
-                    self.ready_workers.push(worker_id);
                 }
                 Message::Channel(s) => {
                     self.clients.lock().push(s);

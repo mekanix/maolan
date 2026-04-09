@@ -18,10 +18,10 @@ use crate::{
     state::{ClipPeaks, MidiClipPreviewMap, State},
     widget::{midi_edit, pitch_correction},
 };
-use editor::{EditorViewArgs, OwnedEditorViewArgs};
+use editor::EditorViewArgs;
 use iced::{
     Background, Color, Element, Length, Point,
-    widget::{Id, Space, Stack, column, container, lazy, mouse_area, pin, row, scrollable, slider},
+    widget::{Id, Space, Stack, column, container, mouse_area, pin, row, scrollable, slider},
 };
 use maolan_widgets::{
     horizontal_scrollbar::HorizontalScrollbar, vertical_scrollbar::VerticalScrollbar,
@@ -138,6 +138,7 @@ pub struct Workspace {
 
 pub struct WorkspaceViewArgs<'a> {
     pub session_root: Option<&'a PathBuf>,
+    pub video_runtime: &'a crate::video_runtime::VideoRuntime,
     pub playhead_samples: Option<f64>,
     pub transport_active: bool,
     pub pixels_per_sample: f32,
@@ -256,6 +257,7 @@ impl Workspace {
     pub fn view<'a>(&'a self, args: WorkspaceViewArgs<'a>) -> Element<'a, Message> {
         let WorkspaceViewArgs {
             session_root,
+            video_runtime,
             playhead_samples,
             transport_active,
             pixels_per_sample,
@@ -412,8 +414,9 @@ impl Workspace {
         });
         let clip_snap_edges = self.collect_clip_snap_edges();
 
-        let editor_render_hash = self.editor.render_hash(&EditorViewArgs {
+        let editor_body: Element<'_, Message> = self.editor.view(EditorViewArgs {
             session_root,
+            video_runtime,
             pixels_per_sample,
             samples_per_bar,
             snap_mode,
@@ -428,27 +431,6 @@ impl Workspace {
             midi_clip_previews,
             visible_track_window,
         });
-        let editor = self.editor.clone();
-        let editor_args_owned = OwnedEditorViewArgs {
-            session_root: session_root.cloned(),
-            pixels_per_sample,
-            samples_per_bar,
-            snap_mode,
-            samples_per_beat,
-            active_clip_drag: active_clip_drag.cloned(),
-            active_target_track: active_clip_target_track.map(str::to_string),
-            active_target_valid: active_clip_target_valid,
-            active_clip_snap_adjust_samples,
-            active_clip_snap_targets: active_clip_snap_targets.to_vec(),
-            recording_preview_bounds,
-            recording_preview_peaks: recording_preview_peaks.cloned(),
-            midi_clip_previews: midi_clip_previews.cloned(),
-            visible_track_window,
-        };
-        let editor_body: Element<'_, Message> = lazy(editor_render_hash, move |_| {
-            editor.clone().into_view_owned(editor_args_owned.clone())
-        })
-        .into();
         let editor_with_playhead = if let Some(x) = playhead_x_timeline {
             Stack::from_vec(vec![
                 editor_body,
@@ -908,11 +890,13 @@ impl Workspace {
         session_root: Option<&PathBuf>,
         split_resize_hovered: bool,
         split_secondary_resize_hovered: bool,
+        video_runtime: &crate::video_runtime::VideoRuntime,
     ) -> Element<'_, Message> {
         self.video.view(
             session_root,
             split_resize_hovered,
             split_secondary_resize_hovered,
+            video_runtime,
         )
     }
 

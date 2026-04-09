@@ -217,6 +217,7 @@ impl Maolan {
                     let view = match view_kind {
                         View::Workspace => self.workspace.view(WorkspaceViewArgs {
                             session_root: self.session_dir.as_ref(),
+                            video_runtime: &self.video_runtime,
                             playhead_samples: Some(self.transport_samples),
                             transport_active: self.playing,
                             pixels_per_sample: self.pixels_per_sample(),
@@ -273,6 +274,7 @@ impl Maolan {
                                     self.session_dir.as_ref(),
                                     self.video_preview_split_resize_hovered,
                                     self.video_preview_split_secondary_resize_hovered,
+                                    &self.video_runtime,
                                 ),)
                                 .height(Length::Fixed(video_preview_height)),
                                 mouse_area(
@@ -298,6 +300,7 @@ impl Maolan {
                                 .on_press(Message::VideoPreviewResizeStart),
                                 self.workspace.view(WorkspaceViewArgs {
                                     session_root: self.session_dir.as_ref(),
+                                    video_runtime: &self.video_runtime,
                                     playhead_samples: Some(self.transport_samples),
                                     transport_active: self.playing,
                                     pixels_per_sample: self.pixels_per_sample(),
@@ -354,6 +357,7 @@ impl Maolan {
                         View::TrackPlugins => self.track_plugins.view(),
                         View::Piano => self.workspace.piano_view(WorkspaceViewArgs {
                             session_root: None,
+                            video_runtime: &self.video_runtime,
                             playhead_samples: Some(self.transport_samples),
                             transport_active: self.playing,
                             pixels_per_sample: self.pixels_per_sample(),
@@ -400,6 +404,7 @@ impl Maolan {
                         View::PitchCorrection => {
                             self.workspace.pitch_correction_view(WorkspaceViewArgs {
                                 session_root: None,
+                                video_runtime: &self.video_runtime,
                                 playhead_samples: Some(self.transport_samples),
                                 transport_active: self.playing,
                                 pixels_per_sample: self.pixels_per_sample(),

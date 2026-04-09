@@ -2,9 +2,13 @@ use iced::{
     Point, Rectangle, Size, mouse,
     widget::{Id, text_editor},
 };
-use maolan_engine::{kind::Kind, message::Action};
+use maolan_engine::{
+    kind::Kind,
+    message::{Action, VideoClipData, VideoFrameBuffer},
+    mutex::UnsafeMutex,
+};
 pub use maolan_widgets::midi::{PianoControllerLane, PianoNrpnKind, PianoRpnKind};
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use crate::state::AudioBackendOption;
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
@@ -821,6 +825,23 @@ pub enum Message {
         length: usize,
         offset: usize,
         peaks: crate::state::ClipPeaks,
+    },
+    VideoPreviewFrameLoaded {
+        track_name: String,
+        clip: VideoClipData,
+        interval_samples: usize,
+        result: Result<Arc<UnsafeMutex<VideoFrameBuffer>>, String>,
+    },
+    VideoCurrentFrameLoaded {
+        track_name: String,
+        clip: VideoClipData,
+        interval_samples: usize,
+        result: Result<Arc<UnsafeMutex<VideoFrameBuffer>>, String>,
+    },
+    VideoRuntimeDecodeFinished {
+        clip_key: String,
+        preview: bool,
+        generation: u64,
     },
     ClipOpenPitchCorrectionProgress {
         clip_name: String,

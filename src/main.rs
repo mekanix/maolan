@@ -16,6 +16,7 @@ mod template_save;
 mod toolbar;
 mod track;
 mod ui_timing;
+mod video_runtime;
 mod widget;
 mod workspace;
 
